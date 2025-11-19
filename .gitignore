@@ -1,0 +1,11 @@
+# Ignore output folder with generated NDJSON and binaries
+out/
+
+# Ignore CSV datasets (MovieLens)
+*.csv
+
+# Ignore any local binaries
+*.exe
+
+# OS files
+.DS_Store
