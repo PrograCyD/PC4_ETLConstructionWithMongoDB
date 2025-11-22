@@ -19,6 +19,9 @@ import (
 	"sync"
 	"time"
 
+	"pc4_etl/internal/mappers"
+	"pc4_etl/internal/models"
+
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -75,117 +78,12 @@ func parseTitleAndYear(raw string) (string, *int) {
 	return raw, nil
 }
 
-type Links struct {
-	Movielens string `json:"movielens,omitempty"`
-	IMDB      string `json:"imdb,omitempty"`
-	TMDB      string `json:"tmdb,omitempty"`
-}
-
-type GenomeTag struct {
-	Tag       string  `json:"tag"`
-	Relevance float64 `json:"relevance"`
-}
-
-type RatingStats struct {
-	Average     float64 `json:"average"`
-	Count       int     `json:"count"`
-	LastRatedAt string  `json:"lastRatedAt,omitempty"`
-}
-
-type CastMember struct {
-	Name       string `json:"name"`
-	ProfileURL string `json:"profileUrl,omitempty"`
-}
-
-type ExternalData struct {
-	PosterURL   string       `json:"posterUrl,omitempty"`
-	Overview    string       `json:"overview,omitempty"`
-	Cast        []CastMember `json:"cast,omitempty"`
-	Director    string       `json:"director,omitempty"`
-	Runtime     int          `json:"runtime,omitempty"`
-	Budget      int          `json:"budget,omitempty"`
-	Revenue     int64        `json:"revenue,omitempty"`
-	TMDBFetched bool         `json:"tmdbFetched"`
-}
-
-type MovieDoc struct {
-	MovieID      int           `json:"movieId"`
-	IIdx         *int          `json:"iIdx,omitempty"`
-	Title        string        `json:"title"`
-	Year         *int          `json:"year,omitempty"`
-	Genres       []string      `json:"genres"`
-	Links        *Links        `json:"links,omitempty"`
-	GenomeTags   []GenomeTag   `json:"genomeTags,omitempty"`
-	UserTags     []string      `json:"userTags,omitempty"`
-	RatingStats  *RatingStats  `json:"ratingStats,omitempty"`
-	ExternalData *ExternalData `json:"externalData,omitempty"`
-	CreatedAt    string        `json:"createdAt"`
-	UpdatedAt    string        `json:"updatedAt"`
-}
-
-type RatingDoc struct {
-	UserID    int     `json:"userId"`
-	MovieID   int     `json:"movieId"`
-	Rating    float64 `json:"rating"`
-	Timestamp int64   `json:"timestamp"`
-}
-
-type UserDoc struct {
-	UserID       int    `json:"userId"`
-	UIdx         *int   `json:"uIdx,omitempty"`
-	Email        string `json:"email"`
-	PasswordHash string `json:"passwordHash"`
-	Role         string `json:"role"`
-	CreatedAt    string `json:"createdAt"`
-}
-
-type Neighbor struct {
-	MovieID int     `json:"movieId"`
-	IIdx    int     `json:"iIdx"`
-	Sim     float64 `json:"sim"`
-}
-
-type SimilarityDoc struct {
-	ID        string     `json:"_id"`
-	MovieID   int        `json:"movieId"`
-	IIdx      int        `json:"iIdx"`
-	Metric    string     `json:"metric"`
-	K         int        `json:"k"`
-	Neighbors []Neighbor `json:"neighbors"`
-	UpdatedAt string     `json:"updatedAt"`
-}
-
-// Estructuras para respuestas de TMDB API
-type TMDBMovieResponse struct {
-	ID          int    `json:"id"`
-	Title       string `json:"title"`
-	Overview    string `json:"overview"`
-	PosterPath  string `json:"poster_path"`
-	Runtime     int    `json:"runtime"`
-	Budget      int    `json:"budget"`
-	Revenue     int64  `json:"revenue"`
-	ReleaseDate string `json:"release_date"`
-}
-
-type TMDBCreditsResponse struct {
-	Cast []struct {
-		Name        string `json:"name"`
-		Character   string `json:"character"`
-		Order       int    `json:"order"`
-		ProfilePath string `json:"profile_path"`
-	} `json:"cast"`
-	Crew []struct {
-		Name string `json:"name"`
-		Job  string `json:"job"`
-	} `json:"crew"`
-}
-
 // Cliente TMDB con rate limiting y cache
 type TMDBClient struct {
 	apiKey      string
 	httpClient  *http.Client
 	rateLimiter <-chan time.Time
-	cache       map[string]*ExternalData
+	cache       map[string]*models.ExternalData
 	cacheMutex  sync.RWMutex
 }
 
@@ -194,11 +92,11 @@ func NewTMDBClient(apiKey string, requestsPerSecond int) *TMDBClient {
 		apiKey:      apiKey,
 		httpClient:  &http.Client{Timeout: 10 * time.Second},
 		rateLimiter: time.Tick(time.Second / time.Duration(requestsPerSecond)),
-		cache:       make(map[string]*ExternalData),
+		cache:       make(map[string]*models.ExternalData),
 	}
 }
 
-func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*ExternalData, error) {
+func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*models.ExternalData, error) {
 	// Check cache
 	c.cacheMutex.RLock()
 	if cached, ok := c.cache[tmdbID]; ok {
@@ -220,7 +118,7 @@ func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*ExternalData,
 
 	if resp.StatusCode == 404 {
 		// Movie not found, return empty data
-		emptyData := &ExternalData{TMDBFetched: false}
+		emptyData := &models.ExternalData{TMDBFetched: false}
 		c.cacheMutex.Lock()
 		c.cache[tmdbID] = emptyData
 		c.cacheMutex.Unlock()
@@ -231,7 +129,7 @@ func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*ExternalData,
 		return nil, fmt.Errorf("TMDB API returned status %d", resp.StatusCode)
 	}
 
-	var movieData TMDBMovieResponse
+	var movieData models.TMDBMovieResponse
 	if err := json.NewDecoder(resp.Body).Decode(&movieData); err != nil {
 		return nil, fmt.Errorf("error decoding movie response: %w", err)
 	}
@@ -245,16 +143,16 @@ func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*ExternalData,
 	}
 	defer creditsResp.Body.Close()
 
-	var creditsData TMDBCreditsResponse
+	var creditsData models.TMDBCreditsResponse
 	if creditsResp.StatusCode == 200 {
 		if err := json.NewDecoder(creditsResp.Body).Decode(&creditsData); err != nil {
 			// Non-fatal error, continue without credits
-			creditsData = TMDBCreditsResponse{}
+			creditsData = models.TMDBCreditsResponse{}
 		}
 	}
 
 	// Build ExternalData
-	externalData := &ExternalData{
+	externalData := &models.ExternalData{
 		Overview:    movieData.Overview,
 		Runtime:     movieData.Runtime,
 		Budget:      movieData.Budget,
@@ -272,7 +170,7 @@ func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*ExternalData,
 		if i >= maxCast {
 			break
 		}
-		castMember := CastMember{Name: member.Name}
+		castMember := models.CastMember{Name: member.Name}
 		if member.ProfilePath != "" {
 			castMember.ProfileURL = fmt.Sprintf("https://image.tmdb.org/t/p/w185%s", member.ProfilePath)
 		}
@@ -296,7 +194,7 @@ func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*ExternalData,
 }
 
 // loadLinks carga los links desde links.csv
-func loadLinks(path string) (map[int]*Links, error) {
+func loadLinks(path string) (map[int]*models.Links, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -311,7 +209,7 @@ func loadLinks(path string) (map[int]*Links, error) {
 		return nil, err
 	}
 
-	links := make(map[int]*Links)
+	links := make(map[int]*models.Links)
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
@@ -325,7 +223,7 @@ func loadLinks(path string) (map[int]*Links, error) {
 		imdbId := strings.TrimSpace(rec[1])
 		tmdbId := strings.TrimSpace(rec[2])
 
-		link := &Links{}
+		link := &models.Links{}
 		if movieId > 0 {
 			link.Movielens = fmt.Sprintf("https://movielens.org/movies/%d", movieId)
 		}
@@ -375,7 +273,7 @@ func loadGenomeTags(path string) (map[int]string, error) {
 }
 
 // loadGenomeScores carga los scores de relevancia (movieId -> tagId -> relevance)
-func loadGenomeScores(path string, genomeTagsMap map[int]string, minRelevance float64) (map[int][]GenomeTag, error) {
+func loadGenomeScores(path string, genomeTagsMap map[int]string, minRelevance float64) (map[int][]models.GenomeTag, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -390,7 +288,7 @@ func loadGenomeScores(path string, genomeTagsMap map[int]string, minRelevance fl
 		return nil, err
 	}
 
-	scores := make(map[int][]GenomeTag)
+	scores := make(map[int][]models.GenomeTag)
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
@@ -407,7 +305,7 @@ func loadGenomeScores(path string, genomeTagsMap map[int]string, minRelevance fl
 		// Filtrar solo tags con relevancia mayor al umbral
 		if relevance >= minRelevance {
 			if tagName, ok := genomeTagsMap[tagId]; ok {
-				scores[movieId] = append(scores[movieId], GenomeTag{
+				scores[movieId] = append(scores[movieId], models.GenomeTag{
 					Tag:       tagName,
 					Relevance: relevance,
 				})
@@ -437,12 +335,6 @@ func normalizeTag(tag string) string {
 	tag = strings.Trim(tag, ".,;:!?\"'`-_")
 
 	return tag
-}
-
-// UserTagWithFrequency estructura para ordenar tags por frecuencia
-type UserTagWithFrequency struct {
-	Tag       string
-	Frequency int
 }
 
 // loadUserTags carga los tags de usuarios con frecuencia (movieId -> []tag ordenados por popularidad)
@@ -493,9 +385,9 @@ func loadUserTags(path string) (map[int][]string, error) {
 	result := make(map[int][]string)
 	for movieId, tags := range tagFrequency {
 		// Crear lista de tags con su frecuencia
-		tagList := make([]UserTagWithFrequency, 0, len(tags))
+		tagList := make([]models.UserTagWithFrequency, 0, len(tags))
 		for tag, users := range tags {
-			tagList = append(tagList, UserTagWithFrequency{
+			tagList = append(tagList, models.UserTagWithFrequency{
 				Tag:       tag,
 				Frequency: len(users), // Número de usuarios únicos que asignaron este tag
 			})
@@ -528,7 +420,7 @@ func loadUserTags(path string) (map[int][]string, error) {
 }
 
 // loadRatingStats calcula estadísticas de ratings (movieId -> stats)
-func loadRatingStats(path string) (map[int]*RatingStats, error) {
+func loadRatingStats(path string) (map[int]*models.RatingStats, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -577,7 +469,7 @@ func loadRatingStats(path string) (map[int]*RatingStats, error) {
 	}
 
 	// Calcular promedios
-	stats := make(map[int]*RatingStats)
+	stats := make(map[int]*models.RatingStats)
 	for movieId, acc := range accums {
 		if acc.count > 0 {
 			avg := acc.sum / float64(acc.count)
@@ -585,7 +477,7 @@ func loadRatingStats(path string) (map[int]*RatingStats, error) {
 			if acc.lastTs > 0 {
 				lastRatedAt = time.Unix(acc.lastTs, 0).UTC().Format(time.RFC3339)
 			}
-			stats[movieId] = &RatingStats{
+			stats[movieId] = &models.RatingStats{
 				Average:     avg,
 				Count:       acc.count,
 				LastRatedAt: lastRatedAt,
@@ -670,183 +562,6 @@ func loadUserMap(path string) (map[int]int, error) {
 	return userMap, nil
 }
 
-// IDMapper gestiona el mapeo dinámico de IDs con thread-safety
-type IDMapper struct {
-	mu      sync.RWMutex
-	mapping map[int]int
-	nextIdx int
-	changed bool
-}
-
-// NewIDMapper crea un nuevo mapeador con el mapa inicial cargado
-func NewIDMapper(initialMap map[int]int) *IDMapper {
-	maxIdx := -1
-	for _, idx := range initialMap {
-		if idx > maxIdx {
-			maxIdx = idx
-		}
-	}
-	return &IDMapper{
-		mapping: initialMap,
-		nextIdx: maxIdx + 1,
-		changed: false,
-	}
-}
-
-// Get obtiene el índice mapeado, o -1 si no existe
-func (m *IDMapper) Get(id int) int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if idx, ok := m.mapping[id]; ok {
-		return idx
-	}
-	return -1
-}
-
-// GetOrCreate obtiene el índice existente o crea uno nuevo
-func (m *IDMapper) GetOrCreate(id int) int {
-	// Primero intentar lectura sin bloqueo de escritura
-	m.mu.RLock()
-	if idx, ok := m.mapping[id]; ok {
-		m.mu.RUnlock()
-		return idx
-	}
-	m.mu.RUnlock()
-
-	// Si no existe, adquirir lock de escritura
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check en caso de que otro goroutine ya lo creó
-	if idx, ok := m.mapping[id]; ok {
-		return idx
-	}
-
-	// Crear nuevo mapeo
-	idx := m.nextIdx
-	m.mapping[id] = idx
-	m.nextIdx++
-	m.changed = true
-	return idx
-}
-
-// HasChanged indica si el mapa fue modificado
-func (m *IDMapper) HasChanged() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.changed
-}
-
-// GetMapping devuelve una copia del mapa actual
-func (m *IDMapper) GetMapping() map[int]int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	copy := make(map[int]int, len(m.mapping))
-	for k, v := range m.mapping {
-		copy[k] = v
-	}
-	return copy
-}
-
-// Count devuelve el número de mapeos
-func (m *IDMapper) Count() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.mapping)
-}
-
-// saveItemMap guarda el mapeo movieId -> iIdx a un archivo CSV
-func saveItemMap(path string, itemMap map[int]int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(bufio.NewWriter(f))
-	defer w.Flush()
-
-	// Escribir header
-	if err := w.Write([]string{"movieId", "iIdx"}); err != nil {
-		return err
-	}
-
-	// Ordenar por iIdx para mantener consistencia
-	type kv struct {
-		movieId int
-		iIdx    int
-	}
-	items := make([]kv, 0, len(itemMap))
-	for movieId, iIdx := range itemMap {
-		items = append(items, kv{movieId, iIdx})
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].iIdx < items[j].iIdx
-	})
-
-	// Escribir filas
-	for _, item := range items {
-		if err := w.Write([]string{
-			strconv.Itoa(item.movieId),
-			strconv.Itoa(item.iIdx),
-		}); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// saveUserMap guarda el mapeo userId -> uIdx a un archivo CSV
-func saveUserMap(path string, userMap map[int]int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(bufio.NewWriter(f))
-	defer w.Flush()
-
-	// Escribir header
-	if err := w.Write([]string{"userId", "uIdx"}); err != nil {
-		return err
-	}
-
-	// Ordenar por uIdx para mantener consistencia
-	type kv struct {
-		userId int
-		uIdx   int
-	}
-	users := make([]kv, 0, len(userMap))
-	for userId, uIdx := range userMap {
-		users = append(users, kv{userId, uIdx})
-	}
-	sort.Slice(users, func(i, j int) bool {
-		return users[i].uIdx < users[j].uIdx
-	})
-
-	// Escribir filas
-	for _, user := range users {
-		if err := w.Write([]string{
-			strconv.Itoa(user.userId),
-			strconv.Itoa(user.uIdx),
-		}); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // generateRandomPassword genera un password de 10 dígitos aleatorios
 func generateRandomPassword() (string, error) {
 	password := ""
@@ -870,7 +585,7 @@ func hashPassword(password string) (string, error) {
 }
 
 // processUsers genera users.ndjson con passwords hasheados
-func processUsers(ratingsPath, outPath, passwordLogPath string, userMapper *IDMapper, hashPasswords bool) (int, error) {
+func processUsers(ratingsPath, outPath, passwordLogPath string, userMapper *mappers.IDMapper, hashPasswords bool) (int, error) {
 	// Primero, leer ratings para obtener todos los usuarios únicos
 	f, err := os.Open(ratingsPath)
 	if err != nil {
@@ -953,7 +668,7 @@ func processUsers(ratingsPath, outPath, passwordLogPath string, userMapper *IDMa
 		}
 
 		// Crear documento
-		doc := UserDoc{
+		doc := models.UserDoc{
 			UserID:       uid,
 			Email:        email,
 			PasswordHash: passwordHash,
@@ -984,7 +699,7 @@ func processUsers(ratingsPath, outPath, passwordLogPath string, userMapper *IDMa
 }
 
 // loadSimilarities carga las similitudes desde item_topk_cosine_conc.csv
-func loadSimilarities(path string, itemMapper *IDMapper) (map[int][]Neighbor, error) {
+func loadSimilarities(path string, itemMapper *mappers.IDMapper) (map[int][]models.Neighbor, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -1007,7 +722,7 @@ func loadSimilarities(path string, itemMapper *IDMapper) (map[int][]Neighbor, er
 	}
 
 	// Agrupar por iIdx
-	similarities := make(map[int][]Neighbor)
+	similarities := make(map[int][]models.Neighbor)
 	for {
 		rec, err := r.Read()
 		if err == io.EOF {
@@ -1025,7 +740,7 @@ func loadSimilarities(path string, itemMapper *IDMapper) (map[int][]Neighbor, er
 			// Obtener movieId del jIdx
 			jMovieId := reverseMap[jIdx]
 
-			neighbor := Neighbor{
+			neighbor := models.Neighbor{
 				MovieID: jMovieId,
 				IIdx:    jIdx,
 				Sim:     sim,
@@ -1038,7 +753,7 @@ func loadSimilarities(path string, itemMapper *IDMapper) (map[int][]Neighbor, er
 }
 
 // processSimilarities genera similarities.ndjson
-func processSimilarities(outPath string, similarities map[int][]Neighbor, itemMapper *IDMapper) (int, error) {
+func processSimilarities(outPath string, similarities map[int][]models.Neighbor, itemMapper *mappers.IDMapper) (int, error) {
 	// Crear reverse map: iIdx -> movieId
 	itemMap := itemMapper.GetMapping()
 	reverseMap := make(map[int]int)
@@ -1066,7 +781,7 @@ func processSimilarities(outPath string, similarities map[int][]Neighbor, itemMa
 			neighbors = neighbors[:20]
 		}
 
-		doc := SimilarityDoc{
+		doc := models.SimilarityDoc{
 			ID:        fmt.Sprintf("%d_cosine_k20", iIdx),
 			MovieID:   movieId,
 			IIdx:      iIdx,
@@ -1085,7 +800,7 @@ func processSimilarities(outPath string, similarities map[int][]Neighbor, itemMa
 	return written, nil
 }
 
-func processMovies(inPath, outPath string, links map[int]*Links, genomeTags map[int][]GenomeTag, userTags map[int][]string, ratingStats map[int]*RatingStats, itemMapper *IDMapper, topGenomeTags int, tmdbClient *TMDBClient, fetchExternal bool) (int, error) {
+func processMovies(inPath, outPath string, links map[int]*models.Links, genomeTags map[int][]models.GenomeTag, userTags map[int][]string, ratingStats map[int]*models.RatingStats, itemMapper *mappers.IDMapper, topGenomeTags int, tmdbClient *TMDBClient, fetchExternal bool) (int, error) {
 	f, err := os.Open(inPath)
 	if err != nil {
 		return 0, err
@@ -1158,16 +873,14 @@ func processMovies(inPath, outPath string, links map[int]*Links, genomeTags map[
 			}
 		}
 
-		doc := MovieDoc{
+		doc := models.MovieDoc{
 			MovieID:   mid,
 			Title:     title,
 			Year:      year,
 			Genres:    genres,
 			CreatedAt: now,
 			UpdatedAt: now,
-		}
-
-		// Agregar iIdx usando el mapper dinámico
+		} // Agregar iIdx usando el mapper dinámico
 		iIdx := itemMapper.GetOrCreate(mid)
 		doc.IIdx = &iIdx
 
@@ -1296,7 +1009,7 @@ func processRatings(inPath, outPath string) (int, error) {
 			ts, _ = strconv.ParseInt(rec[3], 10, 64)
 		}
 
-		doc := RatingDoc{
+		doc := models.RatingDoc{
 			UserID:    uid,
 			MovieID:   mid,
 			Rating:    rating,
@@ -1526,7 +1239,7 @@ func main() {
 	links, err := loadLinks(linksPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar links.csv: %v\n", err)
-		links = make(map[int]*Links)
+		links = make(map[int]*models.Links)
 	}
 	fmt.Printf("  ✓ %d links cargados\n", len(links))
 
@@ -1542,7 +1255,7 @@ func main() {
 	genomeScores, err := loadGenomeScores(genomeScoresPath, genomeTagsMap, *minRelevance)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar genome-scores.csv: %v\n", err)
-		genomeScores = make(map[int][]GenomeTag)
+		genomeScores = make(map[int][]models.GenomeTag)
 	}
 	fmt.Printf("  ✓ Genome scores cargados para %d películas (relevancia >= %.2f)\n", len(genomeScores), *minRelevance)
 
@@ -1558,7 +1271,7 @@ func main() {
 	ratingStats, err := loadRatingStats(ratingsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar ratings.csv: %v\n", err)
-		ratingStats = make(map[int]*RatingStats)
+		ratingStats = make(map[int]*models.RatingStats)
 	}
 	fmt.Printf("  ✓ Estadísticas calculadas para %d películas\n", len(ratingStats))
 
@@ -1569,7 +1282,7 @@ func main() {
 		itemMap = make(map[int]int)
 	}
 	fmt.Printf("  ✓ Mapeo de items cargado para %d películas\n", len(itemMap))
-	itemMapper := NewIDMapper(itemMap)
+	itemMapper := mappers.NewIDMapper(itemMap)
 
 	fmt.Println("Cargando mapeo de usuarios...")
 	userMap, err := loadUserMap(userMapPath)
@@ -1578,7 +1291,7 @@ func main() {
 		userMap = make(map[int]int)
 	}
 	fmt.Printf("  ✓ Mapeo de usuarios cargado para %d usuarios\n", len(userMap))
-	userMapper := NewIDMapper(userMap)
+	userMapper := mappers.NewIDMapper(userMap)
 
 	fmt.Println()
 	if *fetchExternal {
@@ -1623,7 +1336,7 @@ func main() {
 	similarities, serr := loadSimilarities(similaritiesPath, itemMapper)
 	if serr != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar similitudes: %v\n", serr)
-		similarities = make(map[int][]Neighbor)
+		similarities = make(map[int][]models.Neighbor)
 	}
 	fmt.Printf("  ✓ Similitudes cargadas para %d películas\n", len(similarities))
 
@@ -1640,7 +1353,7 @@ func main() {
 		if itemMapper.HasChanged() {
 			fmt.Println()
 			fmt.Println("Actualizando item_map.csv con nuevos movieIds...")
-			if err := saveItemMap(itemMapPath, itemMapper.GetMapping()); err != nil {
+			if err := mappers.SaveItemMap(itemMapPath, itemMapper.GetMapping()); err != nil {
 				fmt.Fprintf(os.Stderr, "Advertencia: no se pudo actualizar item_map.csv: %v\n", err)
 			} else {
 				fmt.Printf("  ✓ item_map.csv actualizado (%d películas)\n", itemMapper.Count())
@@ -1648,7 +1361,7 @@ func main() {
 		}
 		if userMapper.HasChanged() {
 			fmt.Println("Actualizando user_map.csv con nuevos userIds...")
-			if err := saveUserMap(userMapPath, userMapper.GetMapping()); err != nil {
+			if err := mappers.SaveUserMap(userMapPath, userMapper.GetMapping()); err != nil {
 				fmt.Fprintf(os.Stderr, "Advertencia: no se pudo actualizar user_map.csv: %v\n", err)
 			} else {
 				fmt.Printf("  ✓ user_map.csv actualizado (%d usuarios)\n", userMapper.Count())
