@@ -1,1454 +1,28 @@
 package main
 
 import (
-	"bufio"
-	"crypto/rand"
-	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"math/big"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
+	"pc4_etl/internal/external"
+	"pc4_etl/internal/loaders"
+	"pc4_etl/internal/mappers"
+	"pc4_etl/internal/models"
+	"pc4_etl/internal/processors"
+	"pc4_etl/internal/utils"
 )
 
 var yearRe = regexp.MustCompile(`\((\d{4})\)\s*$`)
-
-// loadEnvFile carga variables de entorno desde un archivo .env
-func loadEnvFile(filename string) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// Ignorar líneas vacías y comentarios
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		// Parsear KEY=VALUE
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			value := strings.TrimSpace(parts[1])
-			// Remover comillas si existen
-			value = strings.Trim(value, "\"'")
-			os.Setenv(key, value)
-		}
-	}
-	return scanner.Err()
-}
-
-func isoNow() string {
-	return time.Now().UTC().Format(time.RFC3339)
-}
-
-func parseTitleAndYear(raw string) (string, *int) {
-	raw = strings.TrimSpace(raw)
-	m := yearRe.FindStringSubmatch(raw)
-	if len(m) == 2 {
-		y, err := strconv.Atoi(m[1])
-		if err == nil {
-			// remove last occurrence of (YYYY)
-			idx := strings.LastIndex(raw, "(")
-			if idx > 0 {
-				title := strings.TrimSpace(raw[:idx])
-				return title, &y
-			}
-			return strings.TrimSpace(raw), &y
-		}
-	}
-	// fallback: no year
-	return raw, nil
-}
-
-type Links struct {
-	Movielens string `json:"movielens,omitempty"`
-	IMDB      string `json:"imdb,omitempty"`
-	TMDB      string `json:"tmdb,omitempty"`
-}
-
-type GenomeTag struct {
-	Tag       string  `json:"tag"`
-	Relevance float64 `json:"relevance"`
-}
-
-type RatingStats struct {
-	Average     float64 `json:"average"`
-	Count       int     `json:"count"`
-	LastRatedAt string  `json:"lastRatedAt,omitempty"`
-}
-
-type CastMember struct {
-	Name       string `json:"name"`
-	ProfileURL string `json:"profileUrl,omitempty"`
-}
-
-type ExternalData struct {
-	PosterURL   string       `json:"posterUrl,omitempty"`
-	Overview    string       `json:"overview,omitempty"`
-	Cast        []CastMember `json:"cast,omitempty"`
-	Director    string       `json:"director,omitempty"`
-	Runtime     int          `json:"runtime,omitempty"`
-	Budget      int          `json:"budget,omitempty"`
-	Revenue     int64        `json:"revenue,omitempty"`
-	TMDBFetched bool         `json:"tmdbFetched"`
-}
-
-type MovieDoc struct {
-	MovieID      int           `json:"movieId"`
-	IIdx         *int          `json:"iIdx,omitempty"`
-	Title        string        `json:"title"`
-	Year         *int          `json:"year,omitempty"`
-	Genres       []string      `json:"genres"`
-	Links        *Links        `json:"links,omitempty"`
-	GenomeTags   []GenomeTag   `json:"genomeTags,omitempty"`
-	UserTags     []string      `json:"userTags,omitempty"`
-	RatingStats  *RatingStats  `json:"ratingStats,omitempty"`
-	ExternalData *ExternalData `json:"externalData,omitempty"`
-	CreatedAt    string        `json:"createdAt"`
-	UpdatedAt    string        `json:"updatedAt"`
-}
-
-type RatingDoc struct {
-	UserID    int     `json:"userId"`
-	MovieID   int     `json:"movieId"`
-	Rating    float64 `json:"rating"`
-	Timestamp int64   `json:"timestamp"`
-}
-
-type UserDoc struct {
-	UserID       int    `json:"userId"`
-	UIdx         *int   `json:"uIdx,omitempty"`
-	Email        string `json:"email"`
-	PasswordHash string `json:"passwordHash"`
-	Role         string `json:"role"`
-	CreatedAt    string `json:"createdAt"`
-}
-
-type Neighbor struct {
-	MovieID int     `json:"movieId"`
-	IIdx    int     `json:"iIdx"`
-	Sim     float64 `json:"sim"`
-}
-
-type SimilarityDoc struct {
-	ID        string     `json:"_id"`
-	MovieID   int        `json:"movieId"`
-	IIdx      int        `json:"iIdx"`
-	Metric    string     `json:"metric"`
-	K         int        `json:"k"`
-	Neighbors []Neighbor `json:"neighbors"`
-	UpdatedAt string     `json:"updatedAt"`
-}
-
-// Estructuras para respuestas de TMDB API
-type TMDBMovieResponse struct {
-	ID          int    `json:"id"`
-	Title       string `json:"title"`
-	Overview    string `json:"overview"`
-	PosterPath  string `json:"poster_path"`
-	Runtime     int    `json:"runtime"`
-	Budget      int    `json:"budget"`
-	Revenue     int64  `json:"revenue"`
-	ReleaseDate string `json:"release_date"`
-}
-
-type TMDBCreditsResponse struct {
-	Cast []struct {
-		Name        string `json:"name"`
-		Character   string `json:"character"`
-		Order       int    `json:"order"`
-		ProfilePath string `json:"profile_path"`
-	} `json:"cast"`
-	Crew []struct {
-		Name string `json:"name"`
-		Job  string `json:"job"`
-	} `json:"crew"`
-}
-
-// Cliente TMDB con rate limiting y cache
-type TMDBClient struct {
-	apiKey      string
-	httpClient  *http.Client
-	rateLimiter <-chan time.Time
-	cache       map[string]*ExternalData
-	cacheMutex  sync.RWMutex
-}
-
-func NewTMDBClient(apiKey string, requestsPerSecond int) *TMDBClient {
-	return &TMDBClient{
-		apiKey:      apiKey,
-		httpClient:  &http.Client{Timeout: 10 * time.Second},
-		rateLimiter: time.Tick(time.Second / time.Duration(requestsPerSecond)),
-		cache:       make(map[string]*ExternalData),
-	}
-}
-
-func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*ExternalData, error) {
-	// Check cache
-	c.cacheMutex.RLock()
-	if cached, ok := c.cache[tmdbID]; ok {
-		c.cacheMutex.RUnlock()
-		return cached, nil
-	}
-	c.cacheMutex.RUnlock()
-
-	// Rate limiting
-	<-c.rateLimiter
-
-	// Fetch movie details
-	movieURL := fmt.Sprintf("https://api.themoviedb.org/3/movie/%s?api_key=%s", tmdbID, c.apiKey)
-	resp, err := c.httpClient.Get(movieURL)
-	if err != nil {
-		return nil, fmt.Errorf("error fetching movie details: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 404 {
-		// Movie not found, return empty data
-		emptyData := &ExternalData{TMDBFetched: false}
-		c.cacheMutex.Lock()
-		c.cache[tmdbID] = emptyData
-		c.cacheMutex.Unlock()
-		return emptyData, nil
-	}
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("TMDB API returned status %d", resp.StatusCode)
-	}
-
-	var movieData TMDBMovieResponse
-	if err := json.NewDecoder(resp.Body).Decode(&movieData); err != nil {
-		return nil, fmt.Errorf("error decoding movie response: %w", err)
-	}
-
-	// Fetch credits
-	<-c.rateLimiter
-	creditsURL := fmt.Sprintf("https://api.themoviedb.org/3/movie/%s/credits?api_key=%s", tmdbID, c.apiKey)
-	creditsResp, err := c.httpClient.Get(creditsURL)
-	if err != nil {
-		return nil, fmt.Errorf("error fetching credits: %w", err)
-	}
-	defer creditsResp.Body.Close()
-
-	var creditsData TMDBCreditsResponse
-	if creditsResp.StatusCode == 200 {
-		if err := json.NewDecoder(creditsResp.Body).Decode(&creditsData); err != nil {
-			// Non-fatal error, continue without credits
-			creditsData = TMDBCreditsResponse{}
-		}
-	}
-
-	// Build ExternalData
-	externalData := &ExternalData{
-		Overview:    movieData.Overview,
-		Runtime:     movieData.Runtime,
-		Budget:      movieData.Budget,
-		Revenue:     movieData.Revenue,
-		TMDBFetched: true,
-	}
-
-	if movieData.PosterPath != "" {
-		externalData.PosterURL = fmt.Sprintf("https://image.tmdb.org/t/p/w500%s", movieData.PosterPath)
-	}
-
-	// Extract cast (top 10 with profile images)
-	maxCast := 10
-	for i, member := range creditsData.Cast {
-		if i >= maxCast {
-			break
-		}
-		castMember := CastMember{Name: member.Name}
-		if member.ProfilePath != "" {
-			castMember.ProfileURL = fmt.Sprintf("https://image.tmdb.org/t/p/w185%s", member.ProfilePath)
-		}
-		externalData.Cast = append(externalData.Cast, castMember)
-	}
-
-	// Extract director
-	for _, member := range creditsData.Crew {
-		if member.Job == "Director" {
-			externalData.Director = member.Name
-			break
-		}
-	}
-
-	// Cache result
-	c.cacheMutex.Lock()
-	c.cache[tmdbID] = externalData
-	c.cacheMutex.Unlock()
-
-	return externalData, nil
-}
-
-// loadLinks carga los links desde links.csv
-func loadLinks(path string) (map[int]*Links, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	links := make(map[int]*Links)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 3 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[0])
-		imdbId := strings.TrimSpace(rec[1])
-		tmdbId := strings.TrimSpace(rec[2])
-
-		link := &Links{}
-		if movieId > 0 {
-			link.Movielens = fmt.Sprintf("https://movielens.org/movies/%d", movieId)
-		}
-		if imdbId != "" {
-			link.IMDB = fmt.Sprintf("http://www.imdb.com/title/tt%s/", imdbId)
-		}
-		if tmdbId != "" {
-			link.TMDB = fmt.Sprintf("https://www.themoviedb.org/movie/%s", tmdbId)
-		}
-
-		links[movieId] = link
-	}
-	return links, nil
-}
-
-// loadGenomeTags carga el mapeo de tagId -> tag
-func loadGenomeTags(path string) (map[int]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	tags := make(map[int]string)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 2 {
-			continue
-		}
-
-		tagId, _ := strconv.Atoi(rec[0])
-		tag := strings.TrimSpace(rec[1])
-		tags[tagId] = tag
-	}
-	return tags, nil
-}
-
-// loadGenomeScores carga los scores de relevancia (movieId -> tagId -> relevance)
-func loadGenomeScores(path string, genomeTagsMap map[int]string, minRelevance float64) (map[int][]GenomeTag, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	scores := make(map[int][]GenomeTag)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 3 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[0])
-		tagId, _ := strconv.Atoi(rec[1])
-		relevance, _ := strconv.ParseFloat(rec[2], 64)
-
-		// Filtrar solo tags con relevancia mayor al umbral
-		if relevance >= minRelevance {
-			if tagName, ok := genomeTagsMap[tagId]; ok {
-				scores[movieId] = append(scores[movieId], GenomeTag{
-					Tag:       tagName,
-					Relevance: relevance,
-				})
-			}
-		}
-	}
-
-	// Ordenar por relevancia descendente
-	for movieId := range scores {
-		sort.Slice(scores[movieId], func(i, j int) bool {
-			return scores[movieId][i].Relevance > scores[movieId][j].Relevance
-		})
-	}
-
-	return scores, nil
-}
-
-// normalizeTag normaliza un tag para eliminar duplicados y typos
-func normalizeTag(tag string) string {
-	// Convertir a minúsculas y trim
-	tag = strings.TrimSpace(strings.ToLower(tag))
-
-	// Eliminar múltiples espacios consecutivos
-	tag = regexp.MustCompile(`\s+`).ReplaceAllString(tag, " ")
-
-	// Eliminar caracteres especiales al inicio/final
-	tag = strings.Trim(tag, ".,;:!?\"'`-_")
-
-	return tag
-}
-
-// UserTagWithFrequency estructura para ordenar tags por frecuencia
-type UserTagWithFrequency struct {
-	Tag       string
-	Frequency int
-}
-
-// loadUserTags carga los tags de usuarios con frecuencia (movieId -> []tag ordenados por popularidad)
-func loadUserTags(path string) (map[int][]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	// Estructura: movieId -> tag normalizado -> set de userIds que lo asignaron
-	tagFrequency := make(map[int]map[string]map[int]struct{})
-
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 4 {
-			continue
-		}
-
-		userId, _ := strconv.Atoi(rec[0])
-		movieId, _ := strconv.Atoi(rec[1])
-		tag := normalizeTag(rec[2])
-
-		if tag != "" && movieId > 0 && userId > 0 {
-			if tagFrequency[movieId] == nil {
-				tagFrequency[movieId] = make(map[string]map[int]struct{})
-			}
-			if tagFrequency[movieId][tag] == nil {
-				tagFrequency[movieId][tag] = make(map[int]struct{})
-			}
-			// Agregar el userId al set (para contar usuarios únicos)
-			tagFrequency[movieId][tag][userId] = struct{}{}
-		}
-	}
-
-	// Convertir a lista ordenada por frecuencia (top 10)
-	result := make(map[int][]string)
-	for movieId, tags := range tagFrequency {
-		// Crear lista de tags con su frecuencia
-		tagList := make([]UserTagWithFrequency, 0, len(tags))
-		for tag, users := range tags {
-			tagList = append(tagList, UserTagWithFrequency{
-				Tag:       tag,
-				Frequency: len(users), // Número de usuarios únicos que asignaron este tag
-			})
-		}
-
-		// Ordenar por frecuencia descendente, luego alfabéticamente
-		sort.Slice(tagList, func(i, j int) bool {
-			if tagList[i].Frequency != tagList[j].Frequency {
-				return tagList[i].Frequency > tagList[j].Frequency
-			}
-			return tagList[i].Tag < tagList[j].Tag
-		})
-
-		// Tomar top 10 más frecuentes
-		maxTags := 10
-		if len(tagList) > maxTags {
-			tagList = tagList[:maxTags]
-		}
-
-		// Extraer solo los nombres de los tags
-		finalTags := make([]string, len(tagList))
-		for i, t := range tagList {
-			finalTags[i] = t.Tag
-		}
-
-		result[movieId] = finalTags
-	}
-
-	return result, nil
-}
-
-// loadRatingStats calcula estadísticas de ratings (movieId -> stats)
-func loadRatingStats(path string) (map[int]*RatingStats, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	// Acumuladores
-	type accumulator struct {
-		sum    float64
-		count  int
-		lastTs int64
-	}
-
-	accums := make(map[int]*accumulator)
-
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 4 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[1])
-		rating, _ := strconv.ParseFloat(rec[2], 64)
-		timestamp, _ := strconv.ParseInt(rec[3], 10, 64)
-
-		if accums[movieId] == nil {
-			accums[movieId] = &accumulator{}
-		}
-
-		accums[movieId].sum += rating
-		accums[movieId].count++
-		if timestamp > accums[movieId].lastTs {
-			accums[movieId].lastTs = timestamp
-		}
-	}
-
-	// Calcular promedios
-	stats := make(map[int]*RatingStats)
-	for movieId, acc := range accums {
-		if acc.count > 0 {
-			avg := acc.sum / float64(acc.count)
-			lastRatedAt := ""
-			if acc.lastTs > 0 {
-				lastRatedAt = time.Unix(acc.lastTs, 0).UTC().Format(time.RFC3339)
-			}
-			stats[movieId] = &RatingStats{
-				Average:     avg,
-				Count:       acc.count,
-				LastRatedAt: lastRatedAt,
-			}
-		}
-	}
-
-	return stats, nil
-}
-
-// loadItemMap carga el mapeo movieId -> iIdx desde item_map.csv
-func loadItemMap(path string) (map[int]int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	itemMap := make(map[int]int)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 2 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[0])
-		iIdx, _ := strconv.Atoi(rec[1])
-
-		if movieId > 0 {
-			itemMap[movieId] = iIdx
-		}
-	}
-
-	return itemMap, nil
-}
-
-// loadUserMap carga el mapeo userId -> uIdx desde user_map.csv
-func loadUserMap(path string) (map[int]int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	userMap := make(map[int]int)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 2 {
-			continue
-		}
-
-		userId, _ := strconv.Atoi(rec[0])
-		uIdx, _ := strconv.Atoi(rec[1])
-
-		if userId > 0 {
-			userMap[userId] = uIdx
-		}
-	}
-
-	return userMap, nil
-}
-
-// IDMapper gestiona el mapeo dinámico de IDs con thread-safety
-type IDMapper struct {
-	mu      sync.RWMutex
-	mapping map[int]int
-	nextIdx int
-	changed bool
-}
-
-// NewIDMapper crea un nuevo mapeador con el mapa inicial cargado
-func NewIDMapper(initialMap map[int]int) *IDMapper {
-	maxIdx := -1
-	for _, idx := range initialMap {
-		if idx > maxIdx {
-			maxIdx = idx
-		}
-	}
-	return &IDMapper{
-		mapping: initialMap,
-		nextIdx: maxIdx + 1,
-		changed: false,
-	}
-}
-
-// Get obtiene el índice mapeado, o -1 si no existe
-func (m *IDMapper) Get(id int) int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if idx, ok := m.mapping[id]; ok {
-		return idx
-	}
-	return -1
-}
-
-// GetOrCreate obtiene el índice existente o crea uno nuevo
-func (m *IDMapper) GetOrCreate(id int) int {
-	// Primero intentar lectura sin bloqueo de escritura
-	m.mu.RLock()
-	if idx, ok := m.mapping[id]; ok {
-		m.mu.RUnlock()
-		return idx
-	}
-	m.mu.RUnlock()
-
-	// Si no existe, adquirir lock de escritura
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check en caso de que otro goroutine ya lo creó
-	if idx, ok := m.mapping[id]; ok {
-		return idx
-	}
-
-	// Crear nuevo mapeo
-	idx := m.nextIdx
-	m.mapping[id] = idx
-	m.nextIdx++
-	m.changed = true
-	return idx
-}
-
-// HasChanged indica si el mapa fue modificado
-func (m *IDMapper) HasChanged() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.changed
-}
-
-// GetMapping devuelve una copia del mapa actual
-func (m *IDMapper) GetMapping() map[int]int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	copy := make(map[int]int, len(m.mapping))
-	for k, v := range m.mapping {
-		copy[k] = v
-	}
-	return copy
-}
-
-// Count devuelve el número de mapeos
-func (m *IDMapper) Count() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.mapping)
-}
-
-// saveItemMap guarda el mapeo movieId -> iIdx a un archivo CSV
-func saveItemMap(path string, itemMap map[int]int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(bufio.NewWriter(f))
-	defer w.Flush()
-
-	// Escribir header
-	if err := w.Write([]string{"movieId", "iIdx"}); err != nil {
-		return err
-	}
-
-	// Ordenar por iIdx para mantener consistencia
-	type kv struct {
-		movieId int
-		iIdx    int
-	}
-	items := make([]kv, 0, len(itemMap))
-	for movieId, iIdx := range itemMap {
-		items = append(items, kv{movieId, iIdx})
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].iIdx < items[j].iIdx
-	})
-
-	// Escribir filas
-	for _, item := range items {
-		if err := w.Write([]string{
-			strconv.Itoa(item.movieId),
-			strconv.Itoa(item.iIdx),
-		}); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// saveUserMap guarda el mapeo userId -> uIdx a un archivo CSV
-func saveUserMap(path string, userMap map[int]int) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(bufio.NewWriter(f))
-	defer w.Flush()
-
-	// Escribir header
-	if err := w.Write([]string{"userId", "uIdx"}); err != nil {
-		return err
-	}
-
-	// Ordenar por uIdx para mantener consistencia
-	type kv struct {
-		userId int
-		uIdx   int
-	}
-	users := make([]kv, 0, len(userMap))
-	for userId, uIdx := range userMap {
-		users = append(users, kv{userId, uIdx})
-	}
-	sort.Slice(users, func(i, j int) bool {
-		return users[i].uIdx < users[j].uIdx
-	})
-
-	// Escribir filas
-	for _, user := range users {
-		if err := w.Write([]string{
-			strconv.Itoa(user.userId),
-			strconv.Itoa(user.uIdx),
-		}); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// generateRandomPassword genera un password de 10 dígitos aleatorios
-func generateRandomPassword() (string, error) {
-	password := ""
-	for i := 0; i < 10; i++ {
-		digit, err := rand.Int(rand.Reader, big.NewInt(10))
-		if err != nil {
-			return "", err
-		}
-		password += digit.String()
-	}
-	return password, nil
-}
-
-// hashPassword hashea un password usando bcrypt
-func hashPassword(password string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
-	}
-	return string(bytes), nil
-}
-
-// processUsers genera users.ndjson con passwords hasheados
-func processUsers(ratingsPath, outPath, passwordLogPath string, userMapper *IDMapper, hashPasswords bool) (int, error) {
-	// Primero, leer ratings para obtener todos los usuarios únicos
-	f, err := os.Open(ratingsPath)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return 0, err
-	}
-
-	users := make(map[int]struct{})
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 1 {
-			continue
-		}
-		uid, _ := strconv.Atoi(rec[0])
-		if uid > 0 {
-			users[uid] = struct{}{}
-		}
-	}
-
-	// Ordenar userIds
-	userIds := make([]int, 0, len(users))
-	for uid := range users {
-		userIds = append(userIds, uid)
-	}
-	sort.Ints(userIds)
-
-	// Crear archivo de salida
-	of, err := os.Create(outPath)
-	if err != nil {
-		return 0, err
-	}
-	defer of.Close()
-	w := bufio.NewWriter(of)
-	defer w.Flush()
-
-	// Crear log de passwords
-	logFile, err := os.Create(passwordLogPath)
-	if err != nil {
-		return 0, err
-	}
-	defer logFile.Close()
-	logWriter := bufio.NewWriter(logFile)
-	defer logWriter.Flush()
-
-	// Header del log
-	logWriter.WriteString("userId,uIdx,email,password,passwordHash\n")
-
-	now := isoNow()
-	written := 0
-
-	for _, uid := range userIds {
-		// Generar email
-		email := fmt.Sprintf("user%d@email.com", uid)
-
-		// Generar password aleatorio de 10 dígitos
-		password, err := generateRandomPassword()
-		if err != nil {
-			continue
-		}
-
-		// Hashear password solo si está habilitado
-		passwordHash := password
-		if hashPasswords {
-			hashed, err := hashPassword(password)
-			if err != nil {
-				continue
-			}
-			passwordHash = hashed
-		}
-
-		// Crear documento
-		doc := UserDoc{
-			UserID:       uid,
-			Email:        email,
-			PasswordHash: passwordHash,
-			Role:         "user",
-			CreatedAt:    now,
-		}
-
-		// Agregar uIdx usando el mapper dinámico
-		uIdx := userMapper.GetOrCreate(uid)
-		doc.UIdx = &uIdx
-
-		// Escribir NDJSON
-		b, _ := json.Marshal(doc)
-		w.Write(b)
-		w.WriteByte('\n')
-
-		// Escribir log
-		uIdxStr := "null"
-		if doc.UIdx != nil {
-			uIdxStr = fmt.Sprintf("%d", *doc.UIdx)
-		}
-		logWriter.WriteString(fmt.Sprintf("%d,%s,%s,%s,%s\n", uid, uIdxStr, email, password, passwordHash))
-
-		written++
-	}
-
-	return written, nil
-}
-
-// loadSimilarities carga las similitudes desde item_topk_cosine_conc.csv
-func loadSimilarities(path string, itemMapper *IDMapper) (map[int][]Neighbor, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	// Crear reverse map: iIdx -> movieId
-	itemMap := itemMapper.GetMapping()
-	reverseMap := make(map[int]int)
-	for movieId, iIdx := range itemMap {
-		reverseMap[iIdx] = movieId
-	}
-
-	// Agrupar por iIdx
-	similarities := make(map[int][]Neighbor)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 3 {
-			continue
-		}
-
-		iIdx, _ := strconv.Atoi(rec[0])
-		jIdx, _ := strconv.Atoi(rec[1])
-		sim, _ := strconv.ParseFloat(rec[2], 64)
-
-		if iIdx > 0 && jIdx > 0 {
-			// Obtener movieId del jIdx
-			jMovieId := reverseMap[jIdx]
-
-			neighbor := Neighbor{
-				MovieID: jMovieId,
-				IIdx:    jIdx,
-				Sim:     sim,
-			}
-			similarities[iIdx] = append(similarities[iIdx], neighbor)
-		}
-	}
-
-	return similarities, nil
-}
-
-// processSimilarities genera similarities.ndjson
-func processSimilarities(outPath string, similarities map[int][]Neighbor, itemMapper *IDMapper) (int, error) {
-	// Crear reverse map: iIdx -> movieId
-	itemMap := itemMapper.GetMapping()
-	reverseMap := make(map[int]int)
-	for movieId, iIdx := range itemMap {
-		reverseMap[iIdx] = movieId
-	}
-
-	// Crear archivo de salida
-	of, err := os.Create(outPath)
-	if err != nil {
-		return 0, err
-	}
-	defer of.Close()
-	w := bufio.NewWriter(of)
-	defer w.Flush()
-
-	now := isoNow()
-	written := 0
-
-	for iIdx, neighbors := range similarities {
-		movieId := reverseMap[iIdx]
-
-		// Limitar a k=20
-		if len(neighbors) > 20 {
-			neighbors = neighbors[:20]
-		}
-
-		doc := SimilarityDoc{
-			ID:        fmt.Sprintf("%d_cosine_k20", iIdx),
-			MovieID:   movieId,
-			IIdx:      iIdx,
-			Metric:    "cosine",
-			K:         len(neighbors),
-			Neighbors: neighbors,
-			UpdatedAt: now,
-		}
-
-		b, _ := json.Marshal(doc)
-		w.Write(b)
-		w.WriteByte('\n')
-		written++
-	}
-
-	return written, nil
-}
-
-func processMovies(inPath, outPath string, links map[int]*Links, genomeTags map[int][]GenomeTag, userTags map[int][]string, ratingStats map[int]*RatingStats, itemMapper *IDMapper, topGenomeTags int, tmdbClient *TMDBClient, fetchExternal bool) (int, error) {
-	f, err := os.Open(inPath)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// open output
-	of, err := os.Create(outPath)
-	if err != nil {
-		return 0, err
-	}
-	defer of.Close()
-	w := bufio.NewWriter(of)
-	defer w.Flush()
-
-	// read header
-	header, err := r.Read()
-	if err != nil {
-		return 0, err
-	}
-	idx := map[string]int{}
-	for i, h := range header {
-		idx[h] = i
-	}
-
-	written := 0
-	now := isoNow()
-	fetchedCount := 0
-	errorCount := 0
-
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// skip malformed
-			continue
-		}
-		// guard indexes
-		mid := 0
-		if v, ok := idx["movieId"]; ok && v < len(rec) {
-			mid, _ = strconv.Atoi(rec[v])
-		} else if len(rec) > 0 {
-			mid, _ = strconv.Atoi(rec[0])
-		}
-		titleRaw := ""
-		if v, ok := idx["title"]; ok && v < len(rec) {
-			titleRaw = rec[v]
-		} else if len(rec) > 1 {
-			titleRaw = rec[1]
-		}
-		genresRaw := ""
-		if v, ok := idx["genres"]; ok && v < len(rec) {
-			genresRaw = rec[v]
-		} else if len(rec) > 2 {
-			genresRaw = rec[2]
-		}
-
-		title, year := parseTitleAndYear(titleRaw)
-		genres := []string{}
-		if genresRaw != "" && genresRaw != "(no genres listed)" {
-			for _, g := range strings.Split(genresRaw, "|") {
-				g = strings.TrimSpace(g)
-				if g != "" {
-					genres = append(genres, g)
-				}
-			}
-		}
-
-		doc := MovieDoc{
-			MovieID:   mid,
-			Title:     title,
-			Year:      year,
-			Genres:    genres,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-
-		// Agregar iIdx usando el mapper dinámico
-		iIdx := itemMapper.GetOrCreate(mid)
-		doc.IIdx = &iIdx
-
-		// Agregar links si existen
-		if link, ok := links[mid]; ok {
-			doc.Links = link
-		}
-
-		// Agregar genome tags (limitado a top N más relevantes)
-		if gTags, ok := genomeTags[mid]; ok {
-			if len(gTags) > topGenomeTags {
-				doc.GenomeTags = gTags[:topGenomeTags]
-			} else {
-				doc.GenomeTags = gTags
-			}
-		}
-
-		// Agregar user tags (ya limitados a top 10 por frecuencia en loadUserTags)
-		if uTags, ok := userTags[mid]; ok {
-			doc.UserTags = uTags
-		}
-
-		// Agregar rating stats
-		if stats, ok := ratingStats[mid]; ok {
-			doc.RatingStats = stats
-		}
-
-		// Fetch external data from TMDB if enabled
-		if fetchExternal && tmdbClient != nil && doc.Links != nil && doc.Links.TMDB != "" {
-			// Extract TMDB ID from URL
-			tmdbURL := doc.Links.TMDB
-			parts := strings.Split(tmdbURL, "/")
-			if len(parts) > 0 {
-				tmdbID := parts[len(parts)-1]
-				if tmdbID != "" {
-					externalData, err := tmdbClient.FetchMovieData(tmdbID, title)
-					if err != nil {
-						errorCount++
-						if errorCount%100 == 0 {
-							fmt.Fprintf(os.Stderr, "  ⚠ %d errores al consultar TMDB...\n", errorCount)
-						}
-					} else if externalData != nil && externalData.TMDBFetched {
-						doc.ExternalData = externalData
-						fetchedCount++
-						if fetchedCount%100 == 0 {
-							fmt.Printf("  ℹ %d películas enriquecidas con TMDB...\n", fetchedCount)
-						}
-					}
-				}
-			}
-		}
-
-		b, _ := json.Marshal(doc)
-		w.Write(b)
-		w.WriteByte('\n')
-		written++
-	}
-
-	if fetchExternal {
-		fmt.Printf("  ✓ %d películas enriquecidas con datos de TMDB\n", fetchedCount)
-		if errorCount > 0 {
-			fmt.Printf("  ⚠ %d errores al consultar TMDB\n", errorCount)
-		}
-	}
-
-	return written, nil
-}
-
-func processRatings(inPath, outPath string) (int, error) {
-	f, err := os.Open(inPath)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	of, err := os.Create(outPath)
-	if err != nil {
-		return 0, err
-	}
-	defer of.Close()
-	w := bufio.NewWriter(of)
-	defer w.Flush()
-
-	header, err := r.Read()
-	if err != nil {
-		return 0, err
-	}
-	idx := map[string]int{}
-	for i, h := range header {
-		idx[h] = i
-	}
-
-	written := 0
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			continue
-		}
-		uid := 0
-		mid := 0
-		rating := 0.0
-		ts := int64(0)
-		if v, ok := idx["userId"]; ok && v < len(rec) {
-			uid, _ = strconv.Atoi(rec[v])
-		} else if len(rec) > 0 {
-			uid, _ = strconv.Atoi(rec[0])
-		}
-		if v, ok := idx["movieId"]; ok && v < len(rec) {
-			mid, _ = strconv.Atoi(rec[v])
-		} else if len(rec) > 1 {
-			mid, _ = strconv.Atoi(rec[1])
-		}
-		if v, ok := idx["rating"]; ok && v < len(rec) {
-			rating, _ = strconv.ParseFloat(rec[v], 64)
-		} else if len(rec) > 2 {
-			rating, _ = strconv.ParseFloat(rec[2], 64)
-		}
-		if v, ok := idx["timestamp"]; ok && v < len(rec) {
-			ts, _ = strconv.ParseInt(rec[v], 10, 64)
-		} else if len(rec) > 3 {
-			ts, _ = strconv.ParseInt(rec[3], 10, 64)
-		}
-
-		doc := RatingDoc{
-			UserID:    uid,
-			MovieID:   mid,
-			Rating:    rating,
-			Timestamp: ts,
-		}
-		b, _ := json.Marshal(doc)
-		w.Write(b)
-		w.WriteByte('\n')
-		written++
-	}
-
-	return written, nil
-}
-
-// formatDuration convierte una duración en un formato legible
-func formatDuration(d time.Duration) string {
-	h := int(d.Hours())
-	m := int(d.Minutes()) % 60
-	s := int(d.Seconds()) % 60
-
-	if h > 0 {
-		return fmt.Sprintf("%dh %dm %ds", h, m, s)
-	} else if m > 0 {
-		return fmt.Sprintf("%dm %ds", m, s)
-	}
-	return fmt.Sprintf("%ds", s)
-}
-
-// generateReport genera un archivo de reporte con estadísticas del ETL
-func generateReport(path string, moviesCount, ratingsCount, usersCount, similaritiesCount int, hashedPasswords, fetchedExternal bool, elapsed time.Duration) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	w := bufio.NewWriter(file)
-	defer w.Flush()
-
-	// Encabezado
-	fmt.Fprintln(w, "================================================================================")
-	fmt.Fprintln(w, "               ETL CONSTRUCTION WITH MONGODB - REPORTE DE EJECUCIÓN")
-	fmt.Fprintln(w, "================================================================================")
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Fecha de ejecución: %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
-	fmt.Fprintf(w, "Tiempo total: %s\n", formatDuration(elapsed))
-	fmt.Fprintln(w)
-
-	// Configuración
-	fmt.Fprintln(w, "CONFIGURACIÓN:")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	if fetchedExternal {
-		fmt.Fprintln(w, "  ✓ Fase 2: Datos enriquecidos con TMDB API")
-	} else {
-		fmt.Fprintln(w, "  • Fase 1: Solo datos locales (sin TMDB)")
-	}
-	if hashedPasswords {
-		fmt.Fprintln(w, "  ✓ Passwords hasheados con bcrypt (seguro)")
-	} else {
-		fmt.Fprintln(w, "  ⚠ Passwords sin hashear (modo desarrollo)")
-	}
-	fmt.Fprintln(w)
-
-	// Estadísticas
-	fmt.Fprintln(w, "ESTADÍSTICAS DE DATOS PROCESADOS:")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	fmt.Fprintf(w, "  Movies:        %10d documentos generados\n", moviesCount)
-	fmt.Fprintf(w, "  Ratings:       %10d documentos generados\n", ratingsCount)
-	fmt.Fprintf(w, "  Users:         %10d documentos generados\n", usersCount)
-	fmt.Fprintf(w, "  Similarities:  %10d documentos generados\n", similaritiesCount)
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	total := moviesCount + ratingsCount + usersCount + similaritiesCount
-	fmt.Fprintf(w, "  TOTAL:         %10d documentos\n", total)
-	fmt.Fprintln(w)
-
-	// Archivos generados
-	fmt.Fprintln(w, "ARCHIVOS GENERADOS:")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	fmt.Fprintln(w, "  • out/movies.ndjson         - Películas con metadata completa")
-	fmt.Fprintln(w, "  • out/ratings.ndjson        - Valoraciones de usuarios")
-	fmt.Fprintln(w, "  • out/users.ndjson          - Usuarios con credenciales")
-	fmt.Fprintln(w, "  • out/similarities.ndjson   - Similitudes coseno (k=20)")
-	fmt.Fprintln(w, "  • out/passwords_log.csv     - Log de passwords (desarrollo)")
-	fmt.Fprintln(w, "  • out/report.txt            - Este reporte")
-	fmt.Fprintln(w)
-
-	// Comandos de importación
-	fmt.Fprintln(w, "IMPORTACIÓN A MONGODB:")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	fmt.Fprintln(w, "Ejecutar los siguientes comandos en PowerShell:")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "  $DB = \"movielens\"")
-	fmt.Fprintln(w, "  $OUT_DIR = \"out\"")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "  mongoimport --db $DB --collection movies --file \"$OUT_DIR\\movies.ndjson\"")
-	fmt.Fprintln(w, "  mongoimport --db $DB --collection ratings --file \"$OUT_DIR\\ratings.ndjson\"")
-	fmt.Fprintln(w, "  mongoimport --db $DB --collection users --file \"$OUT_DIR\\users.ndjson\"")
-	fmt.Fprintln(w, "  mongoimport --db $DB --collection similarities --file \"$OUT_DIR\\similarities.ndjson\"")
-	fmt.Fprintln(w)
-
-	// Verificación
-	fmt.Fprintln(w, "VERIFICACIÓN EN MONGODB:")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	fmt.Fprintln(w, "Ejecutar en mongosh para verificar:")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "  use movielens")
-	fmt.Fprintf(w, "  db.movies.countDocuments()       // Esperado: %d\n", moviesCount)
-	fmt.Fprintf(w, "  db.ratings.countDocuments()      // Esperado: %d\n", ratingsCount)
-	fmt.Fprintf(w, "  db.users.countDocuments()        // Esperado: %d\n", usersCount)
-	fmt.Fprintf(w, "  db.similarities.countDocuments() // Esperado: %d\n", similaritiesCount)
-	fmt.Fprintln(w)
-
-	// Índices recomendados
-	fmt.Fprintln(w, "ÍNDICES RECOMENDADOS:")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	fmt.Fprintln(w, "  db.movies.createIndex({ movieId: 1 })")
-	fmt.Fprintln(w, "  db.movies.createIndex({ iIdx: 1 })")
-	fmt.Fprintln(w, "  db.movies.createIndex({ title: \"text\" })")
-	fmt.Fprintln(w, "  db.ratings.createIndex({ userId: 1, movieId: 1 })")
-	fmt.Fprintln(w, "  db.users.createIndex({ userId: 1 }, { unique: true })")
-	fmt.Fprintln(w, "  db.users.createIndex({ email: 1 }, { unique: true })")
-	fmt.Fprintln(w, "  db.similarities.createIndex({ iIdx: 1 })")
-	fmt.Fprintln(w)
-
-	// Notas finales
-	fmt.Fprintln(w, "NOTAS:")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
-	fmt.Fprintln(w, "  • Los IDs (iIdx, uIdx) son mapeos para optimización de modelos ML")
-	fmt.Fprintln(w, "  • GenomeTags limitados a top 10 por relevancia (>= 0.5)")
-	fmt.Fprintln(w, "  • UserTags limitados a top 10 por frecuencia de uso")
-	if fetchedExternal {
-		fmt.Fprintln(w, "  • Cast incluye profileUrl de TMDB (w185)")
-		fmt.Fprintln(w, "  • Posters, sinopsis y runtime obtenidos de TMDB")
-	}
-	if !hashedPasswords {
-		fmt.Fprintln(w, "  ⚠ IMPORTANTE: Passwords sin hashear - NO usar en producción")
-	}
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Para más información consultar README.md y GUIDE.md")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "================================================================================")
-	fmt.Fprintln(w, "                          ¡ETL COMPLETADO EXITOSAMENTE!")
-	fmt.Fprintln(w, "================================================================================")
-
-	return nil
-}
 
 func main() {
 	startTime := time.Now()
 
 	// Intentar cargar .env antes de parsear flags
-	if err := loadEnvFile(".env"); err == nil {
+	if err := utils.LoadEnvFile(".env"); err == nil {
 		fmt.Println("✓ Archivo .env cargado")
 	}
 
@@ -1472,6 +46,12 @@ func main() {
 	tmdbAPIKey := flag.String("tmdb-api-key", "", "TMDB API Key (opcional, se lee de .env si no se especifica)")
 	fetchExternal := flag.Bool("fetch-external", false, "Fetch datos externos desde TMDB API")
 	tmdbRateLimit := flag.Int("tmdb-rate-limit", 4, "Requests por segundo a TMDB API (default: 4)")
+
+	// Flags para ejecución selectiva de procesadores
+	processMovies := flag.Bool("process-movies", true, "Si es true, genera movies.ndjson")
+	processRatings := flag.Bool("process-ratings", true, "Si es true, genera ratings.ndjson")
+	processUsers := flag.Bool("process-users", true, "Si es true, genera users.ndjson")
+	processSimilarities := flag.Bool("process-similarities", true, "Si es true, genera similarities.ndjson")
 
 	flag.Parse()
 
@@ -1509,146 +89,189 @@ func main() {
 	fmt.Println()
 
 	// Inicializar cliente TMDB si es necesario
-	var tmdbClient *TMDBClient
+	var tmdbClient *external.TMDBClient
 	if *fetchExternal {
 		if *tmdbAPIKey == "" {
 			fmt.Fprintln(os.Stderr, "Error: --fetch-external requiere --tmdb-api-key")
 			fmt.Fprintln(os.Stderr, "Obtén tu API key en: https://www.themoviedb.org/settings/api")
 			os.Exit(1)
 		}
-		tmdbClient = NewTMDBClient(*tmdbAPIKey, *tmdbRateLimit)
+		tmdbClient = external.NewTMDBClient(*tmdbAPIKey, *tmdbRateLimit)
 		fmt.Printf("✓ Cliente TMDB inicializado (rate limit: %d req/s)\n", *tmdbRateLimit)
 		fmt.Println()
 	}
 
-	// Cargar datos complementarios
-	fmt.Println("Cargando links...")
-	links, err := loadLinks(linksPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar links.csv: %v\n", err)
-		links = make(map[int]*Links)
-	}
-	fmt.Printf("  ✓ %d links cargados\n", len(links))
+	// Cargar datos complementarios (solo si son necesarios)
+	var links map[int]*models.Links
+	var genomeScores map[int][]models.GenomeTag
+	var userTags map[int][]string
+	var ratingStats map[int]*models.RatingStats
 
-	fmt.Println("Cargando genome tags...")
-	genomeTagsMap, err := loadGenomeTags(genomeTagsPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar genome-tags.csv: %v\n", err)
-		genomeTagsMap = make(map[int]string)
-	}
-	fmt.Printf("  ✓ %d genome tags cargados\n", len(genomeTagsMap))
+	if *processMovies {
+		fmt.Println("Cargando links...")
+		var err error
+		links, err = loaders.LoadLinks(linksPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar links.csv: %v\n", err)
+			links = make(map[int]*models.Links)
+		}
+		fmt.Printf("  ✓ %d links cargados\n", len(links))
 
-	fmt.Println("Cargando genome scores...")
-	genomeScores, err := loadGenomeScores(genomeScoresPath, genomeTagsMap, *minRelevance)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar genome-scores.csv: %v\n", err)
-		genomeScores = make(map[int][]GenomeTag)
-	}
-	fmt.Printf("  ✓ Genome scores cargados para %d películas (relevancia >= %.2f)\n", len(genomeScores), *minRelevance)
+		fmt.Println("Cargando genome tags...")
+		genomeTagsMap, err := loaders.LoadGenomeTags(genomeTagsPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar genome-tags.csv: %v\n", err)
+			genomeTagsMap = make(map[int]string)
+		}
+		fmt.Printf("  ✓ %d genome tags cargados\n", len(genomeTagsMap))
 
-	fmt.Println("Cargando user tags...")
-	userTags, err := loadUserTags(tagsPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar tags.csv: %v\n", err)
-		userTags = make(map[int][]string)
-	}
-	fmt.Printf("  ✓ User tags cargados para %d películas\n", len(userTags))
+		fmt.Println("Cargando genome scores...")
+		genomeScores, err = loaders.LoadGenomeScores(genomeScoresPath, genomeTagsMap, *minRelevance)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar genome-scores.csv: %v\n", err)
+			genomeScores = make(map[int][]models.GenomeTag)
+		}
+		fmt.Printf("  ✓ Genome scores cargados para %d películas (relevancia >= %.2f)\n", len(genomeScores), *minRelevance)
 
-	fmt.Println("Calculando estadísticas de ratings...")
-	ratingStats, err := loadRatingStats(ratingsPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar ratings.csv: %v\n", err)
-		ratingStats = make(map[int]*RatingStats)
-	}
-	fmt.Printf("  ✓ Estadísticas calculadas para %d películas\n", len(ratingStats))
+		fmt.Println("Cargando user tags...")
+		userTags, err = loaders.LoadUserTags(tagsPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar tags.csv: %v\n", err)
+			userTags = make(map[int][]string)
+		}
+		fmt.Printf("  ✓ User tags cargados para %d películas\n", len(userTags))
 
-	fmt.Println("Cargando mapeo de items...")
-	itemMap, err := loadItemMap(itemMapPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar item_map.csv: %v\n", err)
-		itemMap = make(map[int]int)
+		fmt.Println("Calculando estadísticas de ratings...")
+		ratingStats, err = loaders.LoadRatingStats(ratingsPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar ratings.csv: %v\n", err)
+			ratingStats = make(map[int]*models.RatingStats)
+		}
+		fmt.Printf("  ✓ Estadísticas calculadas para %d películas\n", len(ratingStats))
 	}
-	fmt.Printf("  ✓ Mapeo de items cargado para %d películas\n", len(itemMap))
-	itemMapper := NewIDMapper(itemMap)
 
-	fmt.Println("Cargando mapeo de usuarios...")
-	userMap, err := loadUserMap(userMapPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar user_map.csv: %v\n", err)
-		userMap = make(map[int]int)
+	// Cargar mapeos (siempre necesarios si hay algún procesador activo)
+	var itemMapper *mappers.IDMapper
+	var userMapper *mappers.IDMapper
+
+	if *processMovies || *processSimilarities {
+		fmt.Println("Cargando mapeo de items...")
+		itemMap, err := loaders.LoadItemMap(itemMapPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar item_map.csv: %v\n", err)
+			itemMap = make(map[int]int)
+		}
+		fmt.Printf("  ✓ Mapeo de items cargado para %d películas\n", len(itemMap))
+		itemMapper = mappers.NewIDMapper(itemMap)
 	}
-	fmt.Printf("  ✓ Mapeo de usuarios cargado para %d usuarios\n", len(userMap))
-	userMapper := NewIDMapper(userMap)
 
-	fmt.Println()
-	if *fetchExternal {
-		fmt.Println("Procesando movies con datos externos de TMDB:", moviesPath)
-		fmt.Println("  ⏳ Esto puede tardar varios minutos debido al rate limiting...")
+	if *processUsers {
+		fmt.Println("Cargando mapeo de usuarios...")
+		userMap, err := loaders.LoadUserMap(userMapPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar user_map.csv: %v\n", err)
+			userMap = make(map[int]int)
+		}
+		fmt.Printf("  ✓ Mapeo de usuarios cargado para %d usuarios\n", len(userMap))
+		userMapper = mappers.NewIDMapper(userMap)
+	}
+
+	// Procesar archivos según flags
+	var mcount, rcount, ucount, scount int
+
+	if *processMovies {
+		fmt.Println()
+		if *fetchExternal {
+			fmt.Println("Procesando movies con datos externos de TMDB:", moviesPath)
+			fmt.Println("  ⏳ Esto puede tardar varios minutos debido al rate limiting...")
+		} else {
+			fmt.Println("Procesando movies:", moviesPath)
+		}
+		var merr error
+		mcount, merr = processors.ProcessMovies(moviesPath, moviesOut, links, genomeScores, userTags, ratingStats, itemMapper, *topGenomeTags, tmdbClient, *fetchExternal, yearRe)
+		if merr != nil {
+			fmt.Fprintln(os.Stderr, "error procesando movies:", merr)
+			os.Exit(1)
+		}
+		fmt.Printf("  ✓ Escritas %d películas en %s\n", mcount, moviesOut)
 	} else {
-		fmt.Println("Procesando movies:", moviesPath)
+		fmt.Println()
+		fmt.Println("⏭ Procesamiento de movies omitido (--process-movies=false)")
 	}
-	mcount, merr := processMovies(moviesPath, moviesOut, links, genomeScores, userTags, ratingStats, itemMapper, *topGenomeTags, tmdbClient, *fetchExternal)
-	if merr != nil {
-		fmt.Fprintln(os.Stderr, "error procesando movies:", merr)
-		os.Exit(1)
-	}
-	fmt.Printf("  ✓ Escritas %d películas en %s\n", mcount, moviesOut)
 
-	fmt.Println()
-	fmt.Println("Procesando ratings:", ratingsPath)
-	rcount, rerr := processRatings(ratingsPath, ratingsOut)
-	if rerr != nil {
-		fmt.Fprintln(os.Stderr, "error procesando ratings:", rerr)
-		os.Exit(1)
-	}
-	fmt.Printf("  ✓ Escritas %d entradas en %s\n", rcount, ratingsOut)
-
-	fmt.Println()
-	fmt.Println("Generando users con passwords hasheados...")
-	ucount, uerr := processUsers(ratingsPath, usersOut, passwordLogOut, userMapper, *hashPasswords)
-	if uerr != nil {
-		fmt.Fprintln(os.Stderr, "error generando users:", uerr)
-		os.Exit(1)
-	}
-	fmt.Printf("  ✓ Generados %d usuarios en %s\n", ucount, usersOut)
-	if *hashPasswords {
-		fmt.Printf("  ✓ Passwords hasheados con bcrypt\n")
+	if *processRatings {
+		fmt.Println()
+		fmt.Println("Procesando ratings:", ratingsPath)
+		var rerr error
+		rcount, rerr = processors.ProcessRatings(ratingsPath, ratingsOut)
+		if rerr != nil {
+			fmt.Fprintln(os.Stderr, "error procesando ratings:", rerr)
+			os.Exit(1)
+		}
+		fmt.Printf("  ✓ Escritas %d entradas en %s\n", rcount, ratingsOut)
 	} else {
-		fmt.Printf("  ⚠ Passwords sin hashear (modo rápido)\n")
+		fmt.Println()
+		fmt.Println("⏭ Procesamiento de ratings omitido (--process-ratings=false)")
 	}
-	fmt.Printf("  ✓ Log de passwords guardado en %s\n", passwordLogOut)
 
-	fmt.Println()
-	fmt.Println("Cargando similitudes desde", similaritiesPath, "...")
-	similarities, serr := loadSimilarities(similaritiesPath, itemMapper)
-	if serr != nil {
-		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar similitudes: %v\n", serr)
-		similarities = make(map[int][]Neighbor)
+	if *processUsers {
+		fmt.Println()
+		fmt.Println("Generando users con passwords hasheados...")
+		var uerr error
+		ucount, uerr = processors.ProcessUsers(ratingsPath, usersOut, passwordLogOut, userMapper, *hashPasswords)
+		if uerr != nil {
+			fmt.Fprintln(os.Stderr, "error generando users:", uerr)
+			os.Exit(1)
+		}
+		fmt.Printf("  ✓ Generados %d usuarios en %s\n", ucount, usersOut)
+		if *hashPasswords {
+			fmt.Printf("  ✓ Passwords hasheados con bcrypt\n")
+		} else {
+			fmt.Printf("  ⚠ Passwords sin hashear (modo rápido)\n")
+		}
+		fmt.Printf("  ✓ Log de passwords guardado en %s\n", passwordLogOut)
+	} else {
+		fmt.Println()
+		fmt.Println("⏭ Procesamiento de users omitido (--process-users=false)")
 	}
-	fmt.Printf("  ✓ Similitudes cargadas para %d películas\n", len(similarities))
 
-	fmt.Println("Generando similarities...")
-	scount, serr2 := processSimilarities(similaritiesOut, similarities, itemMapper)
-	if serr2 != nil {
-		fmt.Fprintln(os.Stderr, "error generando similarities:", serr2)
-		os.Exit(1)
+	if *processSimilarities {
+		fmt.Println()
+		fmt.Println("Cargando similitudes desde", similaritiesPath, "...")
+		similarities, serr := loaders.LoadSimilarities(similaritiesPath, itemMapper)
+		if serr != nil {
+			fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar similitudes: %v\n", serr)
+			similarities = make(map[int][]models.Neighbor)
+		}
+		fmt.Printf("  ✓ Similitudes cargadas para %d películas\n", len(similarities))
+
+		fmt.Println("Generando similarities...")
+		var serr2 error
+		scount, serr2 = processors.ProcessSimilarities(similaritiesOut, similarities, itemMapper)
+		if serr2 != nil {
+			fmt.Fprintln(os.Stderr, "error generando similarities:", serr2)
+			os.Exit(1)
+		}
+		fmt.Printf("  ✓ Generadas %d entradas de similitud en %s\n", scount, similaritiesOut)
+	} else {
+		fmt.Println()
+		fmt.Println("⏭ Procesamiento de similarities omitido (--process-similarities=false)")
 	}
-	fmt.Printf("  ✓ Generadas %d entradas de similitud en %s\n", scount, similaritiesOut)
 
 	// Persistir mapeos si fueron modificados y el flag está activo
 	if *updateMappings {
-		if itemMapper.HasChanged() {
+		if itemMapper != nil && itemMapper.HasChanged() {
 			fmt.Println()
 			fmt.Println("Actualizando item_map.csv con nuevos movieIds...")
-			if err := saveItemMap(itemMapPath, itemMapper.GetMapping()); err != nil {
+			if err := mappers.SaveItemMap(itemMapPath, itemMapper.GetMapping()); err != nil {
 				fmt.Fprintf(os.Stderr, "Advertencia: no se pudo actualizar item_map.csv: %v\n", err)
 			} else {
 				fmt.Printf("  ✓ item_map.csv actualizado (%d películas)\n", itemMapper.Count())
 			}
 		}
-		if userMapper.HasChanged() {
+		if userMapper != nil && userMapper.HasChanged() {
 			fmt.Println("Actualizando user_map.csv con nuevos userIds...")
-			if err := saveUserMap(userMapPath, userMapper.GetMapping()); err != nil {
+			if err := mappers.SaveUserMap(userMapPath, userMapper.GetMapping()); err != nil {
 				fmt.Fprintf(os.Stderr, "Advertencia: no se pudo actualizar user_map.csv: %v\n", err)
 			} else {
 				fmt.Printf("  ✓ user_map.csv actualizado (%d usuarios)\n", userMapper.Count())
@@ -1659,7 +282,7 @@ func main() {
 	// Generar reporte final
 	elapsedTime := time.Since(startTime)
 	reportPath := filepath.Join(*outDir, "report.txt")
-	if err := generateReport(reportPath, mcount, rcount, ucount, scount, *hashPasswords, *fetchExternal, elapsedTime); err != nil {
+	if err := utils.GenerateReport(reportPath, mcount, rcount, ucount, scount, *hashPasswords, *fetchExternal, *processMovies, *processRatings, *processUsers, *processSimilarities, elapsedTime); err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo generar reporte: %v\n", err)
 	} else {
 		fmt.Printf("\n  ✓ Reporte generado en %s\n", reportPath)
@@ -1667,5 +290,5 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("=== ETL completado exitosamente ===")
-	fmt.Printf("Tiempo total de ejecución: %s\n", formatDuration(elapsedTime))
+	fmt.Printf("Tiempo total de ejecución: %s\n", utils.FormatDuration(elapsedTime))
 }

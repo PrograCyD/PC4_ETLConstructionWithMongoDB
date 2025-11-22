@@ -6,11 +6,196 @@ Sistema ETL (Extract, Transform, Load) desarrollado en Go para procesar el datas
 
 ## 📋 Tabla de Contenidos
 
+- [Resumen del Dataset](#-resumen-del-dataset)
+- [Diccionario de Datos](#-diccionario-de-datos)
 - [Relevancia del Proyecto](#-relevancia-del-proyecto)
 - [Arquitectura del Sistema](#-arquitectura-del-sistema)
 - [Fundamentos Teóricos](#-fundamentos-teóricos)
 - [Colecciones Generadas](#-colecciones-generadas)
 - [Tecnologías Utilizadas](#-tecnologías-utilizadas)
+
+---
+
+## 📊 Resumen del Dataset
+
+El dataset **MovieLens 25M** contiene **25,000,095 calificaciones** y **1,093,360 etiquetas** sobre **62,423 películas** evaluadas por **162,541 usuarios (1995–2019)**.
+
+**Características principales:**
+- Formato: **CSV con cabecera** (UTF-8, separador `,`)
+- Archivos core: **ratings.csv**, **movies.csv**, **links.csv**, **tags.csv**
+- Archivos complementarios: **genome-tags.csv**, **genome-scores.csv**
+- Archivos de mapeo: **item_map.csv**, **user_map.csv** (generados en preprocesamiento PC3)
+- Archivo de similitudes: **item_topk_cosine_conc.csv** (similitudes coseno k=20)
+
+### Propósito de Archivos
+
+| Archivo | ¿Para qué sirve en general? | ¿Para qué lo usamos en PC4? |
+|---------|----------------------------|----------------------------|
+| **ratings.csv** | Calificaciones usuario-película (base del filtrado colaborativo) | Generar colección `ratings` y calcular estadísticas agregadas para `movies` |
+| **movies.csv** | Metadatos de películas (título, géneros) | Base de colección `movies` con enriquecimiento de tags y datos externos |
+| **links.csv** | IDs externos (IMDB, TMDB) | Vincular con TMDB API para obtener posters, cast, sinopsis |
+| **tags.csv** | Etiquetas libres asignadas por usuarios | Normalizar y rankear top 10 `userTags` por película |
+| **genome-tags.csv** | 1,128 tags curados del Tag Genome | Diccionario para interpretar genome-scores |
+| **genome-scores.csv** | Relevancia (0-1) de cada genome tag por película | Seleccionar top 10 `genomeTags` con relevancia ≥ 0.5 |
+| **item_map.csv** | Mapeo movieId → iIdx (índice continuo 0..N-1) | Vincular películas con el modelo de recomendación (similitudes) |
+| **user_map.csv** | Mapeo userId → uIdx (índice continuo 0..M-1) | Generar colección `users` con índices para el modelo |
+| **item_topk_cosine_conc.csv** | Similitudes coseno k=20 pre-calculadas (PC3) | Generar colección `similarities` para recomendaciones |
+
+---
+
+## 📖 Diccionario de Datos
+
+### ratings.csv
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `userId` | int | Identificador anónimo de usuario (1 a 162,541) |
+| `movieId` | int | Identificador único de película (1 a 193,609, con gaps) |
+| `rating` | float | Calificación de 0.5 a 5.0 (incrementos de 0.5) |
+| `timestamp` | int64 | Momento de calificación en UNIX timestamp (UTC) |
+
+**Notas**: 
+- Ordenado por `userId`, luego `movieId`
+- Matriz dispersa: no todos los usuarios califican todas las películas
+
+### movies.csv
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `movieId` | int | Identificador de película (coincide con ratings.csv) |
+| `title` | string | Título con año entre paréntesis (UTF-8), ej: "Toy Story (1995)" |
+| `genres` | string | Géneros separados por `|`, ej: "Adventure\|Animation\|Comedy" |
+
+**Géneros disponibles** (20): Action, Adventure, Animation, Children, Comedy, Crime, Documentary, Drama, Fantasy, Film-Noir, Horror, IMAX, Musical, Mystery, Romance, Sci-Fi, Thriller, War, Western, (no genres listed)
+
+### links.csv
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `movieId` | int | Identificador de película |
+| `imdbId` | string | ID de IMDB (7 dígitos con ceros a la izquierda) |
+| `tmdbId` | int | ID de The Movie Database (TMDB) |
+
+### tags.csv
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `userId` | int | Usuario que asignó el tag |
+| `movieId` | int | Película etiquetada |
+| `tag` | string | Etiqueta en texto libre (ej: "pixar", "visually appealing") |
+| `timestamp` | int64 | Momento de asignación (UNIX timestamp) |
+
+**Notas**: 
+- Requiere normalización (lowercase, trim, deduplicación)
+- Contiene typos y variantes ("pixar" vs "Pixar" vs "PIXAR")
+
+### genome-tags.csv
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `tagId` | int | ID numérico del tag (1 a 1,128) |
+| `tag` | string | Etiqueta curada del sistema Genome |
+
+**Ejemplos**: "dystopia", "ensemble cast", "computer animation"
+
+### genome-scores.csv
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `movieId` | int | Película evaluada |
+| `tagId` | int | ID del genome tag |
+| `relevance` | float | Relevancia del tag para la película (0.0 a 1.0) |
+
+**Notas**:
+- Scores generados algorítmicamente por MovieLens
+- ~13.8M entradas (no todas las películas tienen todos los tags)
+- Valores altos (>0.9) indican fuerte asociación
+
+### item_map.csv (generado en PC3)
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `movieId` | int | ID original de MovieLens |
+| `iIdx` | int | Índice remapeado continuo (0 a 32,719) |
+
+**Propósito**: Mapear IDs dispersos a índices contiguos para matrices del modelo
+
+### user_map.csv (generado en PC3)
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `userId` | int | ID original de MovieLens |
+| `uIdx` | int | Índice remapeado continuo (0 a 162,540) |
+
+**Propósito**: Mapear usuarios a índices contiguos para vectores del modelo
+
+### item_topk_cosine_conc.csv (generado en PC3)
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `iIdx` | int | Índice de la película objetivo |
+| `neighborIdx` | int | Índice del vecino similar |
+| `similarity` | float | Similitud coseno (0.0 a 1.0) |
+
+**Notas**:
+- k=20 vecinos más similares por película
+- Ordenado por similitud descendente
+- ~600K filas (30K películas × 20 vecinos)
+
+---
+
+## 🔗 Relaciones Conceptuales
+
+```
+┌──────────────┐
+│   ratings    │──────┐
+│ userId       │      │
+│ movieId  ────┼──┐   │
+│ rating       │  │   │
+└──────────────┘  │   │
+                  │   │
+        ┌─────────▼───▼──────┐        ┌──────────────┐
+        │       movies        │◄───────│    links     │
+        │ movieId (PK)        │        │ movieId      │
+        │ title               │        │ imdbId       │
+        │ genres          ────┼───┐    │ tmdbId       │
+        └─────────────────────┘   │    └──────────────┘
+                  │               │
+                  │               │    ┌──────────────┐
+        ┌─────────▼───────┐       └───►│     tags     │
+        │  genome-scores  │            │ userId       │
+        │ movieId         │            │ movieId      │
+        │ tagId       ────┼───┐        │ tag          │
+        │ relevance       │   │        └──────────────┘
+        └─────────────────┘   │
+                              │
+                    ┌─────────▼──────┐
+                    │  genome-tags   │
+                    │ tagId (PK)     │
+                    │ tag            │
+                    └────────────────┘
+
+┌──────────────┐        ┌──────────────────┐
+│  user_map    │        │   item_map       │
+│ userId   ────┼───┐    │ movieId      ────┼───┐
+│ uIdx         │   │    │ iIdx             │   │
+└──────────────┘   │    └──────────────────┘   │
+                   │                            │
+         ┌─────────▼────────────────────────────▼──────┐
+         │     item_topk_cosine_conc (similitudes)     │
+         │ iIdx (película)                             │
+         │ neighborIdx (vecino similar)                │
+         │ similarity (coseno)                         │
+         └─────────────────────────────────────────────┘
+```
+
+**Flujo de datos**:
+1. `ratings` conecta usuarios con películas mediante ratings
+2. `movies` define el catálogo con metadatos básicos
+3. `links` permite vincular con APIs externas (TMDB)
+4. `tags` y `genome-scores` enriquecen películas con características
+5. `item_map` y `user_map` mapean IDs originales a índices del modelo
+6. `item_topk_cosine_conc` pre-calcula similitudes para recomendaciones
 
 ---
 
@@ -445,7 +630,17 @@ TMDB Data: © The Movie Database (TMDb)
 
 ## 👥 Autores
 
-Proyecto desarrollado por el equipo de **PC4 - ETL Construction** como parte del sistema integral de recomendación de películas.
+**Grupo 3**
+
+Proyecto desarrollado como parte del curso de **Programación Concurrente y Distribuida** - Universidad Peruana de Ciencias Aplicadas (UPC), ciclo 2025-2.
+
+### Integrantes
+
+| Nombre | Código de Estudiante |
+|--------|----------------------|
+| Marsi Valeria Figueroa Larragán | U202220990 |
+| Liam Mikael Quino Neff | U20221E167 |
+| Mauricio Eduardo Vera Castellón | U20181H114 |
 
 **Repositorio**: [PrograCyD/PC4_ETLConstructionWithMongoDB](https://github.com/PrograCyD/PC4_ETLConstructionWithMongoDB)
 
