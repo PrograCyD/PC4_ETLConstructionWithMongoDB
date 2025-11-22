@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"pc4_etl/internal/loaders"
 	"pc4_etl/internal/mappers"
 	"pc4_etl/internal/models"
 
@@ -193,375 +194,6 @@ func (c *TMDBClient) FetchMovieData(tmdbID string, title string) (*models.Extern
 	return externalData, nil
 }
 
-// loadLinks carga los links desde links.csv
-func loadLinks(path string) (map[int]*models.Links, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	links := make(map[int]*models.Links)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 3 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[0])
-		imdbId := strings.TrimSpace(rec[1])
-		tmdbId := strings.TrimSpace(rec[2])
-
-		link := &models.Links{}
-		if movieId > 0 {
-			link.Movielens = fmt.Sprintf("https://movielens.org/movies/%d", movieId)
-		}
-		if imdbId != "" {
-			link.IMDB = fmt.Sprintf("http://www.imdb.com/title/tt%s/", imdbId)
-		}
-		if tmdbId != "" {
-			link.TMDB = fmt.Sprintf("https://www.themoviedb.org/movie/%s", tmdbId)
-		}
-
-		links[movieId] = link
-	}
-	return links, nil
-}
-
-// loadGenomeTags carga el mapeo de tagId -> tag
-func loadGenomeTags(path string) (map[int]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	tags := make(map[int]string)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 2 {
-			continue
-		}
-
-		tagId, _ := strconv.Atoi(rec[0])
-		tag := strings.TrimSpace(rec[1])
-		tags[tagId] = tag
-	}
-	return tags, nil
-}
-
-// loadGenomeScores carga los scores de relevancia (movieId -> tagId -> relevance)
-func loadGenomeScores(path string, genomeTagsMap map[int]string, minRelevance float64) (map[int][]models.GenomeTag, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	scores := make(map[int][]models.GenomeTag)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 3 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[0])
-		tagId, _ := strconv.Atoi(rec[1])
-		relevance, _ := strconv.ParseFloat(rec[2], 64)
-
-		// Filtrar solo tags con relevancia mayor al umbral
-		if relevance >= minRelevance {
-			if tagName, ok := genomeTagsMap[tagId]; ok {
-				scores[movieId] = append(scores[movieId], models.GenomeTag{
-					Tag:       tagName,
-					Relevance: relevance,
-				})
-			}
-		}
-	}
-
-	// Ordenar por relevancia descendente
-	for movieId := range scores {
-		sort.Slice(scores[movieId], func(i, j int) bool {
-			return scores[movieId][i].Relevance > scores[movieId][j].Relevance
-		})
-	}
-
-	return scores, nil
-}
-
-// normalizeTag normaliza un tag para eliminar duplicados y typos
-func normalizeTag(tag string) string {
-	// Convertir a minúsculas y trim
-	tag = strings.TrimSpace(strings.ToLower(tag))
-
-	// Eliminar múltiples espacios consecutivos
-	tag = regexp.MustCompile(`\s+`).ReplaceAllString(tag, " ")
-
-	// Eliminar caracteres especiales al inicio/final
-	tag = strings.Trim(tag, ".,;:!?\"'`-_")
-
-	return tag
-}
-
-// loadUserTags carga los tags de usuarios con frecuencia (movieId -> []tag ordenados por popularidad)
-func loadUserTags(path string) (map[int][]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	// Estructura: movieId -> tag normalizado -> set de userIds que lo asignaron
-	tagFrequency := make(map[int]map[string]map[int]struct{})
-
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 4 {
-			continue
-		}
-
-		userId, _ := strconv.Atoi(rec[0])
-		movieId, _ := strconv.Atoi(rec[1])
-		tag := normalizeTag(rec[2])
-
-		if tag != "" && movieId > 0 && userId > 0 {
-			if tagFrequency[movieId] == nil {
-				tagFrequency[movieId] = make(map[string]map[int]struct{})
-			}
-			if tagFrequency[movieId][tag] == nil {
-				tagFrequency[movieId][tag] = make(map[int]struct{})
-			}
-			// Agregar el userId al set (para contar usuarios únicos)
-			tagFrequency[movieId][tag][userId] = struct{}{}
-		}
-	}
-
-	// Convertir a lista ordenada por frecuencia (top 10)
-	result := make(map[int][]string)
-	for movieId, tags := range tagFrequency {
-		// Crear lista de tags con su frecuencia
-		tagList := make([]models.UserTagWithFrequency, 0, len(tags))
-		for tag, users := range tags {
-			tagList = append(tagList, models.UserTagWithFrequency{
-				Tag:       tag,
-				Frequency: len(users), // Número de usuarios únicos que asignaron este tag
-			})
-		}
-
-		// Ordenar por frecuencia descendente, luego alfabéticamente
-		sort.Slice(tagList, func(i, j int) bool {
-			if tagList[i].Frequency != tagList[j].Frequency {
-				return tagList[i].Frequency > tagList[j].Frequency
-			}
-			return tagList[i].Tag < tagList[j].Tag
-		})
-
-		// Tomar top 10 más frecuentes
-		maxTags := 10
-		if len(tagList) > maxTags {
-			tagList = tagList[:maxTags]
-		}
-
-		// Extraer solo los nombres de los tags
-		finalTags := make([]string, len(tagList))
-		for i, t := range tagList {
-			finalTags[i] = t.Tag
-		}
-
-		result[movieId] = finalTags
-	}
-
-	return result, nil
-}
-
-// loadRatingStats calcula estadísticas de ratings (movieId -> stats)
-func loadRatingStats(path string) (map[int]*models.RatingStats, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	// Acumuladores
-	type accumulator struct {
-		sum    float64
-		count  int
-		lastTs int64
-	}
-
-	accums := make(map[int]*accumulator)
-
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 4 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[1])
-		rating, _ := strconv.ParseFloat(rec[2], 64)
-		timestamp, _ := strconv.ParseInt(rec[3], 10, 64)
-
-		if accums[movieId] == nil {
-			accums[movieId] = &accumulator{}
-		}
-
-		accums[movieId].sum += rating
-		accums[movieId].count++
-		if timestamp > accums[movieId].lastTs {
-			accums[movieId].lastTs = timestamp
-		}
-	}
-
-	// Calcular promedios
-	stats := make(map[int]*models.RatingStats)
-	for movieId, acc := range accums {
-		if acc.count > 0 {
-			avg := acc.sum / float64(acc.count)
-			lastRatedAt := ""
-			if acc.lastTs > 0 {
-				lastRatedAt = time.Unix(acc.lastTs, 0).UTC().Format(time.RFC3339)
-			}
-			stats[movieId] = &models.RatingStats{
-				Average:     avg,
-				Count:       acc.count,
-				LastRatedAt: lastRatedAt,
-			}
-		}
-	}
-
-	return stats, nil
-}
-
-// loadItemMap carga el mapeo movieId -> iIdx desde item_map.csv
-func loadItemMap(path string) (map[int]int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	itemMap := make(map[int]int)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 2 {
-			continue
-		}
-
-		movieId, _ := strconv.Atoi(rec[0])
-		iIdx, _ := strconv.Atoi(rec[1])
-
-		if movieId > 0 {
-			itemMap[movieId] = iIdx
-		}
-	}
-
-	return itemMap, nil
-}
-
-// loadUserMap carga el mapeo userId -> uIdx desde user_map.csv
-func loadUserMap(path string) (map[int]int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	userMap := make(map[int]int)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 2 {
-			continue
-		}
-
-		userId, _ := strconv.Atoi(rec[0])
-		uIdx, _ := strconv.Atoi(rec[1])
-
-		if userId > 0 {
-			userMap[userId] = uIdx
-		}
-	}
-
-	return userMap, nil
-}
-
 // generateRandomPassword genera un password de 10 dígitos aleatorios
 func generateRandomPassword() (string, error) {
 	password := ""
@@ -696,60 +328,6 @@ func processUsers(ratingsPath, outPath, passwordLogPath string, userMapper *mapp
 	}
 
 	return written, nil
-}
-
-// loadSimilarities carga las similitudes desde item_topk_cosine_conc.csv
-func loadSimilarities(path string, itemMapper *mappers.IDMapper) (map[int][]models.Neighbor, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(bufio.NewReader(f))
-	r.FieldsPerRecord = -1
-
-	// skip header
-	if _, err := r.Read(); err != nil {
-		return nil, err
-	}
-
-	// Crear reverse map: iIdx -> movieId
-	itemMap := itemMapper.GetMapping()
-	reverseMap := make(map[int]int)
-	for movieId, iIdx := range itemMap {
-		reverseMap[iIdx] = movieId
-	}
-
-	// Agrupar por iIdx
-	similarities := make(map[int][]models.Neighbor)
-	for {
-		rec, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil || len(rec) < 3 {
-			continue
-		}
-
-		iIdx, _ := strconv.Atoi(rec[0])
-		jIdx, _ := strconv.Atoi(rec[1])
-		sim, _ := strconv.ParseFloat(rec[2], 64)
-
-		if iIdx > 0 && jIdx > 0 {
-			// Obtener movieId del jIdx
-			jMovieId := reverseMap[jIdx]
-
-			neighbor := models.Neighbor{
-				MovieID: jMovieId,
-				IIdx:    jIdx,
-				Sim:     sim,
-			}
-			similarities[iIdx] = append(similarities[iIdx], neighbor)
-		}
-	}
-
-	return similarities, nil
 }
 
 // processSimilarities genera similarities.ndjson
@@ -1236,7 +814,7 @@ func main() {
 
 	// Cargar datos complementarios
 	fmt.Println("Cargando links...")
-	links, err := loadLinks(linksPath)
+	links, err := loaders.LoadLinks(linksPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar links.csv: %v\n", err)
 		links = make(map[int]*models.Links)
@@ -1244,7 +822,7 @@ func main() {
 	fmt.Printf("  ✓ %d links cargados\n", len(links))
 
 	fmt.Println("Cargando genome tags...")
-	genomeTagsMap, err := loadGenomeTags(genomeTagsPath)
+	genomeTagsMap, err := loaders.LoadGenomeTags(genomeTagsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar genome-tags.csv: %v\n", err)
 		genomeTagsMap = make(map[int]string)
@@ -1252,7 +830,7 @@ func main() {
 	fmt.Printf("  ✓ %d genome tags cargados\n", len(genomeTagsMap))
 
 	fmt.Println("Cargando genome scores...")
-	genomeScores, err := loadGenomeScores(genomeScoresPath, genomeTagsMap, *minRelevance)
+	genomeScores, err := loaders.LoadGenomeScores(genomeScoresPath, genomeTagsMap, *minRelevance)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar genome-scores.csv: %v\n", err)
 		genomeScores = make(map[int][]models.GenomeTag)
@@ -1260,7 +838,7 @@ func main() {
 	fmt.Printf("  ✓ Genome scores cargados para %d películas (relevancia >= %.2f)\n", len(genomeScores), *minRelevance)
 
 	fmt.Println("Cargando user tags...")
-	userTags, err := loadUserTags(tagsPath)
+	userTags, err := loaders.LoadUserTags(tagsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar tags.csv: %v\n", err)
 		userTags = make(map[int][]string)
@@ -1268,7 +846,7 @@ func main() {
 	fmt.Printf("  ✓ User tags cargados para %d películas\n", len(userTags))
 
 	fmt.Println("Calculando estadísticas de ratings...")
-	ratingStats, err := loadRatingStats(ratingsPath)
+	ratingStats, err := loaders.LoadRatingStats(ratingsPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar ratings.csv: %v\n", err)
 		ratingStats = make(map[int]*models.RatingStats)
@@ -1276,7 +854,7 @@ func main() {
 	fmt.Printf("  ✓ Estadísticas calculadas para %d películas\n", len(ratingStats))
 
 	fmt.Println("Cargando mapeo de items...")
-	itemMap, err := loadItemMap(itemMapPath)
+	itemMap, err := loaders.LoadItemMap(itemMapPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar item_map.csv: %v\n", err)
 		itemMap = make(map[int]int)
@@ -1285,7 +863,7 @@ func main() {
 	itemMapper := mappers.NewIDMapper(itemMap)
 
 	fmt.Println("Cargando mapeo de usuarios...")
-	userMap, err := loadUserMap(userMapPath)
+	userMap, err := loaders.LoadUserMap(userMapPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar user_map.csv: %v\n", err)
 		userMap = make(map[int]int)
@@ -1333,7 +911,7 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("Cargando similitudes desde", similaritiesPath, "...")
-	similarities, serr := loadSimilarities(similaritiesPath, itemMapper)
+	similarities, serr := loaders.LoadSimilarities(similaritiesPath, itemMapper)
 	if serr != nil {
 		fmt.Fprintf(os.Stderr, "Advertencia: no se pudo cargar similitudes: %v\n", serr)
 		similarities = make(map[int][]models.Neighbor)
