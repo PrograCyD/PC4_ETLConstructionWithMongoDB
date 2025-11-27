@@ -297,7 +297,9 @@ El ETL transforma datos crudos dispersos en **colecciones estructuradas** que pe
 │                                                                       │
 │  ┌───────────────────────────────────────────────────────────┐       │
 │  │ users.ndjson (162K docs)                                  │       │
-│  │ • userId, uIdx, email, passwordHash, role                 │       │
+│  │ • userId, uIdx, firstName, lastName, username             │       │
+│  │ • email, passwordHash, role                               │       │
+│  │ • about, preferredGenres[], createdAt, updatedAt          │       │
 │  └───────────────────────────────────────────────────────────┘       │
 │                                                                       │
 │  ┌───────────────────────────────────────────────────────────┐       │
@@ -309,7 +311,8 @@ El ETL transforma datos crudos dispersos en **colecciones estructuradas** que pe
 │                                                                       │
 │  ┌───────────────────────────────────────────────────────────┐       │
 │  │ passwords_log.csv (162K users)                            │       │
-│  │ • userId, uIdx, email, password, passwordHash             │       │
+│  │ • userId, uIdx, firstName, lastName, username             │       │
+│  │ • email, password, passwordHash                           │       │
 │  └───────────────────────────────────────────────────────────┘       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -430,6 +433,46 @@ rateLimiter: time.Tick(time.Second / 4) // 4 req/s
 
 **Recomendación**: Usar `false` en desarrollo, `true` en producción.
 
+### 7. Generación de Perfiles de Usuario
+
+**Sistema de generación automática de datos realistas**:
+
+El ETL genera perfiles completos para los 162K+ usuarios utilizando datos aleatorios pero coherentes:
+
+**Generación de Nombres**:
+- Librería: `github.com/jaswdr/faker`
+- Método: `GenerateRandomName()` produce combinaciones únicas de nombres y apellidos
+- Ejemplo: "Alexander Johnson", "Sophia Williams", "Michael Chen"
+
+**Generación de Usernames**:
+- Formato: `firstname.lastname{número}`
+- Número basado en `userId % 10000` para garantizar unicidad
+- Ejemplo: "alexander.johnson123", "sophia.williams4567"
+
+**Generación de About (Biografía)**:
+- **70% con géneros**: Templates que mencionan géneros favoritos
+  - "Fan of Action and Drama movies"
+  - "Passionate about Comedy cinema"
+  - "I really like Thriller films"
+- **30% frases simples**: Descripciones genéricas
+  - "Movie lover"
+  - "Film enthusiast"
+  - "Cinema addict"
+
+**Selección de Géneros Preferidos**:
+- Extracción: Se leen todos los géneros únicos de `movies.csv` al inicio
+- Cantidad: Entre 1 y 5 géneros aleatorios por usuario
+- Método: Fisher-Yates shuffle para selección aleatoria uniforme
+- Los géneros se almacenan como array de strings para facilitar queries en MongoDB
+
+**Timestamps**:
+- `createdAt`: Timestamp ISO 8601 del momento de generación
+- `updatedAt`: Inicialmente igual a `createdAt` (se actualizará en futuras modificaciones)
+
+**Trazabilidad**:
+- `passwords_log.csv` incluye todos los campos generados (firstName, lastName, username)
+- Permite auditoría y debugging del proceso de generación
+
 ---
 
 ## 📦 Colecciones Generadas
@@ -505,18 +548,29 @@ rateLimiter: time.Tick(time.Second / 4) // 4 req/s
 {
   "userId": 1,
   "uIdx": 0,
+  "firstName": "Alexander",
+  "lastName": "Johnson",
+  "username": "alexander.johnson1",
   "email": "user1@email.com",
   "passwordHash": "$2a$10$...",
   "role": "user",
-  "createdAt": "2025-11-21T22:39:34Z"
+  "about": "Fan of Action and Drama movies",
+  "preferredGenres": ["Action", "Drama", "Thriller"],
+  "createdAt": "2025-11-27T10:15:30Z",
+  "updatedAt": "2025-11-27T10:15:30Z"
 }
 ```
 
 **Características**:
 - ✅ **uIdx**: ID remapeado para el modelo
-- ✅ **email**: Generado automáticamente
+- ✅ **firstName, lastName**: Nombres aleatorios generados con [faker](https://github.com/jaswdr/faker)
+- ✅ **username**: Formato `firstname.lastname` + número único
+- ✅ **email**: Generado automáticamente como `user{userId}@email.com`
 - ✅ **passwordHash**: bcrypt (opcional con `--hash-passwords`)
-- ✅ **Log disponible**: `passwords_log.csv` con passwords sin hashear
+- ✅ **about**: Descripción personalizada (70% menciona géneros favoritos, 30% frases simples)
+- ✅ **preferredGenres**: Array de 1-5 géneros aleatorios extraídos de movies.csv
+- ✅ **updatedAt**: Igual a createdAt inicialmente
+- ✅ **Log disponible**: `passwords_log.csv` con passwords sin hashear y datos completos del perfil
 
 ### 4. `similarities` (30,202 documentos)
 
@@ -546,6 +600,7 @@ rateLimiter: time.Tick(time.Second / 4) // 4 req/s
 - **Go 1.21+**: Eficiencia, concurrencia nativa, bajo consumo de memoria
 - **Librerías estándar**: `encoding/csv`, `encoding/json`, `net/http`, `bufio`, `sync`
 - **bcrypt**: `golang.org/x/crypto/bcrypt` para hashing de passwords
+- **faker**: `github.com/jaswdr/faker` para generación de datos aleatorios de usuarios (nombres, apellidos)
 - **IDMapper**: Sistema de mapeo dinámico thread-safe para gestión de índices
 
 ### Base de Datos
